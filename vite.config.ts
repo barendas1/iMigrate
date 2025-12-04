@@ -1,6 +1,9 @@
 import react from "@vitejs/plugin-react";
 import path from "path";
 import { defineConfig } from "vite";
+import tailwindcss from "tailwindcss";
+import autoprefixer from "autoprefixer";
+import tailwindConfig from "./tailwind.config";
 
 export default defineConfig({
   plugins: [react()],
@@ -13,6 +16,14 @@ export default defineConfig({
   },
   envDir: path.resolve(import.meta.dirname),
   root: path.resolve(import.meta.dirname, "client"),
+  css: {
+    postcss: {
+      plugins: [
+        tailwindcss(tailwindConfig),
+        autoprefixer(),
+      ],
+    },
+  },
   build: {
     outDir: path.resolve(import.meta.dirname, "dist"),
     emptyOutDir: true,

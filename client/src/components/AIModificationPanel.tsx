@@ -148,10 +148,17 @@ Generate the transformation code:`
       // Clean up the code
       code = code.replace(/```javascript\n?/g, '').replace(/```js\n?/g, '').replace(/```\n?/g, '').trim();
       
-      // Remove any function declarations and extract the body
-      code = code.replace(/^function\s+\w+\s*\([^)]*\)\s*\{/m, '');
-      code = code.replace(/^\([^)]*\)\s*=>\s*\{/m, '');
-      code = code.replace(/\}\s*$/m, '');
+      // Only remove function wrappers if they exist (check for matching pattern)
+      // Check if code starts with function declaration
+      if (/^function\s+\w+\s*\([^)]*\)\s*\{/.test(code)) {
+        code = code.replace(/^function\s+\w+\s*\([^)]*\)\s*\{/m, '');
+        code = code.replace(/\}\s*$/m, ''); // Only remove trailing brace if we removed opening
+      }
+      // Check if code starts with arrow function
+      else if (/^\([^)]*\)\s*=>\s*\{/.test(code)) {
+        code = code.replace(/^\([^)]*\)\s*=>\s*\{/m, '');
+        code = code.replace(/\}\s*$/m, ''); // Only remove trailing brace if we removed opening
+      }
       
       console.log('Executing AI code:', code);
       

@@ -6,6 +6,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import { AlertCircle, CheckCircle2, Download, Eye, FileSpreadsheet, Loader2, Upload, UploadCloud, X } from "lucide-react";
 import { PreviewSection } from "@/components/PreviewSection";
+import { AIModificationPanel } from "@/components/AIModificationPanel";
 import { useCallback, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import * as XLSX from "xlsx";
@@ -35,7 +36,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
   const [convertedData, setConvertedData] = useState<any>(null);
-  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+  const [originalConvertedData, setOriginalConvertedData] = useState<any>(null);
   const [showInlinePreview, setShowInlinePreview] = useState(false);
 
   // File drop handler - supports multiple files
@@ -204,6 +205,7 @@ export default function Home() {
       XLSX.utils.book_append_sheet(newWb, newWs, outputSheetName);
       
       setConvertedData(newWb);
+      setOriginalConvertedData(newWb); // Save original for revert
       setSuccess(true);
       
     } catch (err: any) {
@@ -246,7 +248,7 @@ export default function Home() {
       </header>
 
       <main className="container mt-8">
-        <div className="max-w-4xl mx-auto">
+        <div className="max-w-7xl mx-auto">
           <div className="mb-8 text-center">
             <h2 className="text-3xl font-bold text-dark mb-2">Import & Convert Data</h2>
             <p className="text-muted-foreground">
@@ -262,29 +264,29 @@ export default function Home() {
             setConvertedData(null);
             setShowInlinePreview(false);
           }} className="w-full">
-            <TabsList className="grid w-full grid-cols-3 mb-8 p-1 bg-secondary/5 border border-border rounded-xl h-14">
+            <TabsList className="grid w-full grid-cols-3 mb-4 p-1 bg-secondary/5 border border-border rounded-xl h-12">
               <TabsTrigger 
                 value="mixes" 
-                className="rounded-lg text-base font-medium data-[state=active]:bg-white data-[state=active]:text-primary data-[state=active]:shadow-sm h-12 transition-all"
+                className="rounded-lg text-base font-medium data-[state=active]:bg-white data-[state=active]:text-primary data-[state=active]:shadow-sm h-8 transition-all"
               >
                 Mix Imports
               </TabsTrigger>
               <TabsTrigger 
                 value="materials" 
-                className="rounded-lg text-base font-medium data-[state=active]:bg-white data-[state=active]:text-primary data-[state=active]:shadow-sm h-12 transition-all"
+                className="rounded-lg text-base font-medium data-[state=active]:bg-white data-[state=active]:text-primary data-[state=active]:shadow-sm h-8 transition-all"
               >
                 Material Imports
               </TabsTrigger>
               <TabsTrigger 
                 value="mix-material" 
-                className="rounded-lg text-base font-medium data-[state=active]:bg-white data-[state=active]:text-primary data-[state=active]:shadow-sm h-12 transition-all"
+                className="rounded-lg text-base font-medium data-[state=active]:bg-white data-[state=active]:text-primary data-[state=active]:shadow-sm h-8 transition-all"
               >
                 Mix & Material Upload
               </TabsTrigger>
             </TabsList>
 
-            <TabsContent value="mixes" className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <TabsContent value="mixes" className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <Card className="border-border shadow-sm overflow-hidden">
                 <CardHeader className="bg-secondary/1 border-b border-border pb-6">
                   <CardTitle className="text-xl text-secondary">Configuration</CardTitle>
@@ -334,7 +336,7 @@ export default function Home() {
                 <CardHeader className="bg-secondary/1 border-b border-border pb-6 flex flex-row items-center justify-between">
                   <div>
                     <CardTitle className="text-xl text-secondary">File Upload</CardTitle>
-                    <CardDescription>Upload the file containing mix designs.</CardDescription>
+                    <CardDescription>Upload the Excel/CSV file containing mix designs.</CardDescription>
                   </div>
                   
                   <div className="flex gap-2">
@@ -360,7 +362,7 @@ export default function Home() {
                   </div>
                 </CardHeader>
                 
-                <CardContent className="pt-6 space-y-6">
+                <CardContent className="pt-4 space-y-4">
                   <div 
                     {...getRootProps()} 
                     className={cn(
@@ -406,36 +408,38 @@ export default function Home() {
                         <p className="text-xs text-muted-foreground/70 mt-4">Supported formats: .xlsx, .xls, .csv</p>
                       </>
                     )}
-                  </div>
-
-                  {error && (
-                    <div className="bg-destructive/10 border border-destructive/20 rounded-lg p-4 flex items-start gap-3 text-destructive animate-in fade-in slide-in-from-top-2">
-                      <AlertCircle className="h-5 w-5 mt-0.5 shrink-0" />
-                      <div>
-                        <p className="font-medium">Error</p>
-                        <p className="text-sm opacity-90">{error}</p>
+                    
+                    {error && (
+                      <div className="bg-destructive/10 border border-destructive/20 rounded-lg p-4 flex items-start gap-3 text-destructive animate-in fade-in slide-in-from-top-2 mt-4">
+                        <AlertCircle className="h-5 w-5 mt-0.5 shrink-0" />
+                        <div>
+                          <p className="font-medium">Error</p>
+                          <p className="text-sm opacity-90">{error}</p>
+                        </div>
                       </div>
-                    </div>
-                  )}
+                    )}
 
-                  {success && (
-                    <div className="bg-success/10 border border-success/20 rounded-lg p-4 flex items-start gap-3 text-success animate-in fade-in slide-in-from-top-2">
-                      <CheckCircle2 className="h-5 w-5 mt-0.5 shrink-0" />
-                      <div>
-                        <p className="font-medium">Conversion Successful!</p>
-                        <p className="text-sm opacity-90">Your file has been processed and is ready for download.</p>
+                    {success && (
+                      <div className="bg-success/10 border border-success/20 rounded-lg p-4 flex items-start gap-3 text-success animate-in fade-in slide-in-from-top-2 mt-4">
+                        <CheckCircle2 className="h-5 w-5 mt-0.5 shrink-0" />
+                        <div>
+                          <p className="font-medium">Conversion Successful!</p>
+                          <p className="text-sm opacity-90">Your file has been processed and is ready for download.</p>
+                        </div>
                       </div>
-                    </div>
-                  )}
+                    )}
 
-                  <div className="flex items-center justify-end gap-4 pt-2">
+                    <div className="flex items-center justify-end gap-4 pt-4 mt-4">
                     {success ? (
                       <>
                         <Button 
                           size="lg" 
                           variant="outline"
                           className="border-primary text-primary hover:bg-primary/5 shadow-md hover:shadow-lg transition-all"
-                          onClick={() => setShowInlinePreview(!showInlinePreview)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setShowInlinePreview(!showInlinePreview);
+                          }}
                         >
                           <Eye className="mr-2 h-5 w-5" />
                           {showInlinePreview ? 'Hide Preview' : 'Preview'}
@@ -443,7 +447,10 @@ export default function Home() {
                         <Button 
                           size="lg" 
                           className="bg-success hover:bg-success2 text-white shadow-md hover:shadow-lg transition-all w-full sm:w-auto"
-                          onClick={handleDownload}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDownload();
+                          }}
                         >
                           <Download className="mr-2 h-5 w-5" />
                           Download Converted File
@@ -457,7 +464,10 @@ export default function Home() {
                           (files.length === 0 || !selectedDispatch) && "opacity-50 cursor-not-allowed"
                         )}
                         disabled={files.length === 0 || !selectedDispatch || isProcessing}
-                        onClick={handleConvert}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleConvert();
+                        }}
                       >
                         {isProcessing ? (
                           <>
@@ -471,6 +481,7 @@ export default function Home() {
                         )}
                       </Button>
                     )}
+                    </div>
                   </div>
                 </CardContent>
               </Card>
@@ -482,12 +493,20 @@ export default function Home() {
                   workbook={convertedData}
                   title="Mix Import Preview"
                   onClose={() => setShowInlinePreview(false)}
-                />
+                  onDataChange={(modifiedWorkbook) => setConvertedData(modifiedWorkbook)}
+                >
+                  <AIModificationPanel
+                    workbook={convertedData}
+                    originalWorkbook={originalConvertedData}
+                    onModify={(modifiedWorkbook) => setConvertedData(modifiedWorkbook)}
+                    onRevert={() => setConvertedData(originalConvertedData)}
+                  />
+                </PreviewSection>
               )}
             </TabsContent>
             
-            <TabsContent value="materials" className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <TabsContent value="materials" className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <Card className="border-border shadow-sm overflow-hidden">
                 <CardHeader className="bg-secondary/1 border-b border-border pb-6">
                   <CardTitle className="text-xl text-secondary">Configuration</CardTitle>
@@ -566,7 +585,7 @@ export default function Home() {
                   </div>
                 </CardHeader>
                 
-                <CardContent className="pt-6 space-y-6">
+                <CardContent className="pt-4 space-y-4">
                   <div 
                     {...getRootProps()} 
                     className={cn(
@@ -622,36 +641,38 @@ export default function Home() {
                         </p>
                       </>
                     )}
-                  </div>
-
-                  {error && (
-                    <div className="bg-destructive/10 border border-destructive/20 rounded-lg p-4 flex items-start gap-3 text-destructive animate-in fade-in slide-in-from-top-2">
-                      <AlertCircle className="h-5 w-5 mt-0.5 shrink-0" />
-                      <div>
-                        <p className="font-medium">Error</p>
-                        <p className="text-sm opacity-90">{error}</p>
+                    
+                    {error && (
+                      <div className="bg-destructive/10 border border-destructive/20 rounded-lg p-4 flex items-start gap-3 text-destructive animate-in fade-in slide-in-from-top-2 mt-4">
+                        <AlertCircle className="h-5 w-5 mt-0.5 shrink-0" />
+                        <div>
+                          <p className="font-medium">Error</p>
+                          <p className="text-sm opacity-90">{error}</p>
+                        </div>
                       </div>
-                    </div>
-                  )}
+                    )}
 
-                  {success && (
-                    <div className="bg-success/10 border border-success/20 rounded-lg p-4 flex items-start gap-3 text-success animate-in fade-in slide-in-from-top-2">
-                      <CheckCircle2 className="h-5 w-5 mt-0.5 shrink-0" />
-                      <div>
-                        <p className="font-medium">Conversion Successful!</p>
-                        <p className="text-sm opacity-90">Your files have been processed and are ready for download.</p>
+                    {success && (
+                      <div className="bg-success/10 border border-success/20 rounded-lg p-4 flex items-start gap-3 text-success animate-in fade-in slide-in-from-top-2 mt-4">
+                        <CheckCircle2 className="h-5 w-5 mt-0.5 shrink-0" />
+                        <div>
+                          <p className="font-medium">Conversion Successful!</p>
+                          <p className="text-sm opacity-90">Your files have been processed and are ready for download.</p>
+                        </div>
                       </div>
-                    </div>
-                  )}
+                    )}
 
-                  <div className="flex items-center justify-end gap-4 pt-2">
+                    <div className="flex items-center justify-end gap-4 pt-4 mt-4">
                     {success ? (
                       <>
                         <Button 
                           size="lg" 
                           variant="outline"
                           className="border-primary text-primary hover:bg-primary/5 shadow-md hover:shadow-lg transition-all"
-                          onClick={() => setShowInlinePreview(!showInlinePreview)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setShowInlinePreview(!showInlinePreview);
+                          }}
                         >
                           <Eye className="mr-2 h-5 w-5" />
                           {showInlinePreview ? 'Hide Preview' : 'Preview'}
@@ -659,7 +680,10 @@ export default function Home() {
                         <Button 
                           size="lg" 
                           className="bg-success hover:bg-success2 text-white shadow-md hover:shadow-lg transition-all w-full sm:w-auto"
-                          onClick={handleDownload}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDownload();
+                          }}
                         >
                           <Download className="mr-2 h-5 w-5" />
                           Download Converted File
@@ -673,7 +697,10 @@ export default function Home() {
                           (files.length === 0 || !selectedDispatch) && "opacity-50 cursor-not-allowed"
                         )}
                         disabled={files.length === 0 || !selectedDispatch || isProcessing}
-                        onClick={handleConvert}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleConvert();
+                        }}
                       >
                         {isProcessing ? (
                           <>
@@ -687,6 +714,7 @@ export default function Home() {
                         )}
                       </Button>
                     )}
+                    </div>
                   </div>
                 </CardContent>
               </Card>
@@ -698,11 +726,19 @@ export default function Home() {
                   workbook={convertedData}
                   title="Material Import Preview"
                   onClose={() => setShowInlinePreview(false)}
-                />
+                  onDataChange={(modifiedWorkbook) => setConvertedData(modifiedWorkbook)}
+                >
+                  <AIModificationPanel
+                    workbook={convertedData}
+                    originalWorkbook={originalConvertedData}
+                    onModify={(modifiedWorkbook) => setConvertedData(modifiedWorkbook)}
+                    onRevert={() => setConvertedData(originalConvertedData)}
+                  />
+                </PreviewSection>
               )}
             </TabsContent>
             
-            <TabsContent value="mix-material" className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <TabsContent value="mix-material" className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
               <Card className="border-border shadow-sm overflow-hidden">
                 <CardContent className="pt-20 pb-20 text-center">
                   <div className="max-w-md mx-auto space-y-4">

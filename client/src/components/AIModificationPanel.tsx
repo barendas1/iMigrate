@@ -220,7 +220,7 @@ Generate the transformation code:`
   };
 
   return (
-    <Card className="border-border shadow-sm overflow-hidden">
+    <Card className="border-border shadow-sm overflow-hidden p-0 gap-0">
       <Collapsible open={isOpen} onOpenChange={setIsOpen}>
         <CollapsibleTrigger asChild>
           <CardHeader className="bg-primary/5 border-b border-border pb-3 pt-3 cursor-pointer hover:bg-primary/10 transition-colors">

@@ -28,6 +28,7 @@ export function PreviewSection({ workbook, title, onClose, onDataChange, childre
 
   const rowsPerPage = 100;
 
+  // Auto-refresh preview when workbook changes
   useEffect(() => {
     if (workbook) {
       const sheetName = workbook.SheetNames[0];
@@ -39,15 +40,18 @@ export function PreviewSection({ workbook, title, onClose, onDataChange, childre
 
   if (!workbook) return null;
 
+  // Get headers (first row) and rows (rest)
   const headers = data[0] || [];
   const allRows = data.slice(1);
   const totalRows = allRows.length;
   const totalPages = Math.ceil(totalRows / rowsPerPage);
 
+  // Get current page rows
   const startIndex = (currentPage - 1) * rowsPerPage;
   const endIndex = startIndex + rowsPerPage;
   const rows = allRows.slice(startIndex, endIndex);
 
+  // Handle column resize
   const handleMouseDown = (colIndex: number, e: React.MouseEvent) => {
     e.preventDefault();
     const startX = e.pageX;
@@ -60,14 +64,15 @@ export function PreviewSection({ workbook, title, onClose, onDataChange, childre
     };
 
     const handleMouseUp = () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
     };
 
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
   };
 
+  // Handle cell edit
   const handleCellClick = (rowIndex: number, colIndex: number) => {
     const actualRowIndex = startIndex + rowIndex;
     setEditingCell({ row: actualRowIndex, col: colIndex });
@@ -77,7 +82,7 @@ export function PreviewSection({ workbook, title, onClose, onDataChange, childre
   const handleCellBlur = () => {
     if (editingCell) {
       const newData = [...data];
-      const actualRowIndex = editingCell.row + 1;
+      const actualRowIndex = editingCell.row + 1; // +1 because data includes headers
       if (!newData[actualRowIndex]) {
         newData[actualRowIndex] = [];
       }
@@ -127,88 +132,92 @@ export function PreviewSection({ workbook, title, onClose, onDataChange, childre
       </CardHeader>
 
       <CardContent className="pt-4 space-y-3">
-        {children && <div className="mb-4">{children}</div>}
-
-        {/* SCROLLABLE TABLE CONTAINER */}
-        <div className="h-[500px] w-full rounded-lg border overflow-auto">
-          {/* FIXED THIS LINE */}
-          <div className="min-w-full">
-            <Table>
-              <TableHeader className="bg-card sticky top-0 z-20 shadow-sm">
-                <TableRow>
-                  {headers.map((header: any, index: number) => (
-                    <TableHead
-                      key={index}
-                      className="font-semibold text-dark relative group border-r border-border last:border-r-0 bg-card"
-                      style={{
-                        width: columnWidths[index] || 150,
-                        minWidth: columnWidths[index] || 150,
-                        maxWidth: columnWidths[index] || 150
-                      }}
-                    >
-                      <div className="flex flex-col items-center justify-center text-center whitespace-pre-wrap break-words leading-tight py-2">
-                        {(header || `Column ${index + 1}`).toString().split(" ").join("\n")}
-                      </div>
-                      <div
-                        className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/50 group-hover:bg-primary/30"
-                        onMouseDown={(e) => handleMouseDown(index, e)}
-                      />
-                    </TableHead>
-                  ))}
-                </TableRow>
-              </TableHeader>
-
-              <TableBody>
-                {rows.map((row: any[], rowIndex: number) => (
-                  <TableRow key={rowIndex} className="hover:bg-secondary/5">
-                    {headers.map((_: any, colIndex: number) => {
-                      const actualRowIndex = startIndex + rowIndex;
-                      const isEditing =
-                        editingCell?.row === actualRowIndex && editingCell?.col === colIndex;
-
-                      return (
-                        <TableCell
-                          key={colIndex}
-                          className="whitespace-nowrap p-0 border-r border-border last:border-r-0"
-                          style={{
-                            width: columnWidths[colIndex] || 150,
-                            minWidth: columnWidths[colIndex] || 150,
-                            maxWidth: columnWidths[colIndex] || 150
-                          }}
-                        >
-                          {isEditing ? (
-                            <Input
-                              value={editValue}
-                              onChange={(e) => setEditValue(e.target.value)}
-                              onBlur={handleCellBlur}
-                              onKeyDown={handleKeyDown}
-                              autoFocus
-                              className="h-full border-0 rounded-none focus-visible:ring-2 focus-visible:ring-primary"
-                            />
-                          ) : (
-                            <div
-                              className="px-4 py-2 cursor-text hover:bg-primary/5"
-                              onClick={() => handleCellClick(rowIndex, colIndex)}
-                              style={{
-                                overflow: "hidden",
-                                textOverflow: "ellipsis"
-                              }}
-                            >
-                              {row[colIndex] !== undefined && row[colIndex] !== null
-                                ? String(row[colIndex])
-                                : ""}
-                            </div>
-                          )}
-                        </TableCell>
-                      );
-                    })}
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+        {children && (
+          <div className="mb-4">
+            {children}
           </div>
+        )}
+
+        {/* Scrollable Table */}
+        <div className="h-[500px] w-full rounded-lg border overflow-auto">
+          <Table className="min-w-full">
+            
+            {/* Sticky Header */}
+            <TableHeader className="bg-card sticky top-0 z-20 shadow-sm">
+              <TableRow>
+                {headers.map((header: any, index: number) => (
+                  <TableHead
+                    key={index}
+                    className="font-semibold text-dark relative group border-r border-border last:border-r-0 bg-card"
+                    style={{
+                      width: columnWidths[index] || 150,
+                      minWidth: columnWidths[index] || 150,
+                      maxWidth: columnWidths[index] || 150,
+                    }}
+                  >
+                    <div className="flex flex-col items-center justify-center text-center whitespace-pre-wrap break-words leading-tight py-2">
+                      {(header || `Column ${index + 1}`).toString().split(" ").join("\n")}
+                    </div>
+                    <div
+                      className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/50 group-hover:bg-primary/30"
+                      onMouseDown={(e) => handleMouseDown(index, e)}
+                    />
+                  </TableHead>
+                ))}
+              </TableRow>
+            </TableHeader>
+
+            <TableBody>
+              {rows.map((row: any[], rowIndex: number) => (
+                <TableRow key={rowIndex} className="hover:bg-secondary/5">
+                  {headers.map((_: any, colIndex: number) => {
+                    const actualRowIndex = startIndex + rowIndex;
+                    const isEditing = editingCell?.row === actualRowIndex && editingCell?.col === colIndex;
+
+                    return (
+                      <TableCell
+                        key={colIndex}
+                        className="whitespace-nowrap p-0 border-r border-border last:border-r-0"
+                        style={{
+                          width: columnWidths[colIndex] || 150,
+                          minWidth: columnWidths[colIndex] || 150,
+                          maxWidth: columnWidths[colIndex] || 150,
+                        }}
+                      >
+                        {isEditing ? (
+                          <Input
+                            value={editValue}
+                            onChange={(e) => setEditValue(e.target.value)}
+                            onBlur={handleCellBlur}
+                            onKeyDown={handleKeyDown}
+                            autoFocus
+                            className="h-full border-0 rounded-none focus-visible:ring-2 focus-visible:ring-primary"
+                          />
+                        ) : (
+                          <div
+                            className="px-4 py-2 cursor-text hover:bg-primary/5"
+                            onClick={() => handleCellClick(rowIndex, colIndex)}
+                            style={{
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                            }}
+                          >
+                            {row[colIndex] !== undefined && row[colIndex] !== null
+                              ? String(row[colIndex])
+                              : ""}
+                          </div>
+                        )}
+                      </TableCell>
+                    );
+                  })}
+                </TableRow>
+              ))}
+            </TableBody>
+
+          </Table>
         </div>
 
+        {/* Pagination Controls */}
         <div className="flex items-center justify-between pt-2">
           <div className="text-sm text-muted-foreground">
             Page {currentPage} of {totalPages}
@@ -217,7 +226,7 @@ export function PreviewSection({ workbook, title, onClose, onDataChange, childre
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
+              onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
               disabled={currentPage === 1}
             >
               <ChevronLeft className="h-4 w-4 mr-1" />
@@ -226,7 +235,7 @@ export function PreviewSection({ workbook, title, onClose, onDataChange, childre
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
+              onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
               disabled={currentPage === totalPages}
             >
               Next
@@ -234,6 +243,7 @@ export function PreviewSection({ workbook, title, onClose, onDataChange, childre
             </Button>
           </div>
         </div>
+
       </CardContent>
     </Card>
   );

@@ -305,7 +305,7 @@ export default function Home() {
                   <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
                     <div className="flex-1">
                       <CardTitle className="text-xl text-secondary mb-1">Mix Conversion</CardTitle>
-                      <CardDescription>Upload the Excel/CSV file containing mix designs.</CardDescription>
+                      <CardDescription>Upload 2 files for MPAQ: mix file and materials lookup file.</CardDescription>
                     </div>
                     
                     <div className="flex gap-2">
@@ -314,6 +314,7 @@ export default function Home() {
                         id="file-upload"
                         className="hidden"
                         accept=".xlsx,.xls,.csv"
+                        multiple
                         onChange={(e) => {
                           if (e.target.files && e.target.files.length > 0) {
                             onDrop(Array.from(e.target.files));
@@ -326,7 +327,7 @@ export default function Home() {
                         onClick={() => document.getElementById('file-upload')?.click()}
                       >
                         <Upload className="mr-2 h-4 w-4" />
-                        Select File
+                        Select Files
                       </Button>
                     </div>
                   </div>
@@ -386,9 +387,32 @@ export default function Home() {
                         <div className="w-14 h-14 rounded-full bg-success/10 flex items-center justify-center text-success">
                           <FileSpreadsheet className="h-7 w-7" />
                         </div>
-                        <div>
-                          <p className="text-lg font-semibold text-dark">{files[0].name}</p>
-                          <p className="text-sm text-muted-foreground">{(files[0].size / 1024).toFixed(2)} KB</p>
+                        <div className="w-full space-y-2">
+                          <p className="text-lg font-medium text-dark">{files.length} file{files.length > 1 ? 's' : ''} selected</p>
+                          <div className="space-y-2">
+                            {files.map((file, index) => (
+                              <div key={index} className="flex items-center justify-between bg-white rounded-lg p-2 border border-border">
+                                <div className="flex items-center gap-2 flex-1 min-w-0">
+                                  <FileSpreadsheet className="h-4 w-4 text-secondary shrink-0" />
+                                  <div className="min-w-0 flex-1">
+                                    <p className="text-sm font-medium text-dark truncate">{file.name}</p>
+                                    <p className="text-xs text-muted-foreground">{(file.size / 1024).toFixed(2)} KB</p>
+                                  </div>
+                                </div>
+                                <Button 
+                                  variant="ghost" 
+                                  size="sm" 
+                                  className="text-destructive hover:text-destructive hover:bg-destructive/10 h-8 w-8 p-0 shrink-0"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    removeFile(index);
+                                  }}
+                                >
+                                  <X className="h-4 w-4" />
+                                </Button>
+                              </div>
+                            ))}
+                          </div>
                         </div>
                         <Button 
                           variant="ghost" 
@@ -401,7 +425,7 @@ export default function Home() {
                             setConvertedData(null);
                           }}
                         >
-                          Remove File
+                          Remove All Files
                         </Button>
                       </>
                     ) : (
@@ -410,8 +434,8 @@ export default function Home() {
                           <UploadCloud className="h-7 w-7" />
                         </div>
                         <div>
-                          <p className="text-lg font-medium text-dark">Drag & drop your file here</p>
-                          <p className="text-sm text-muted-foreground mt-1">or click to browse from your computer</p>
+                          <p className="text-lg font-medium text-dark">Drag & drop your files here</p>
+                          <p className="text-sm text-muted-foreground mt-1">or click to browse (select up to 2 files for MPAQ)</p>
                         </div>
                         <p className="text-xs text-muted-foreground/70">Supported formats: .xlsx, .xls, .csv</p>
                       </>

@@ -180,9 +180,11 @@ function createMaterialsLookup(materialsData: any[][]): Map<string, string> {
         const productionCode = row[productionCodeIndex];
         
         if (materialType && productionCode) {
+            const matTypeStr = String(materialType).trim();
+            const prodCodeStr = String(productionCode).trim();
             // Only store if not already present (first occurrence wins)
-            if (!lookup.has(String(materialType))) {
-                lookup.set(String(materialType), String(productionCode));
+            if (!lookup.has(matTypeStr)) {
+                lookup.set(matTypeStr, prodCodeStr);
             }
         }
     }
@@ -341,11 +343,14 @@ export function convertMPAQMixes(mixData: any[][], materialsData?: any[][]): any
                 
                 // Look up Production Item Code from materials file by material name
                 let productionCode = matId; // Default to raw ID
-                if (matName && materialsLookup.has(String(matName))) {
-                    productionCode = materialsLookup.get(String(matName))!;
-                    console.log(`Mapped ${matName} (${matId}) -> ${productionCode}`);
-                } else if (matType !== "Water") {
-                    console.warn(`No lookup found for material: ${matName} (ID: ${matId})`);
+                const matNameStr = String(matName || '').trim();
+                
+                if (matNameStr && materialsLookup.has(matNameStr)) {
+                    productionCode = materialsLookup.get(matNameStr)!;
+                    console.log(`✓ Mapped ${matNameStr} (${matId}) -> ${productionCode}`);
+                } else if (matType !== "Water" && matNameStr) {
+                    console.warn(`✗ No lookup found for material: ${matNameStr} (ID: ${matId})`);
+                    console.warn(`  Lookup has ${materialsLookup.size} entries. First 5:`, Array.from(materialsLookup.entries()).slice(0, 5));
                 }
                 
                 const outRow = [

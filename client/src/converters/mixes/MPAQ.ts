@@ -1,10 +1,10 @@
 /**
- * Sarjeants Mixes Converter
+ * MPAQ Mixes Converter
  * 
- * Converts Sarjeants mix export data to Command Series import format
+ * Converts MPAQ mix export data to Command Series import format
  * Requires two files:
- * 1. Mix list CSV file (mix-list.csv)
- * 2. Materials lookup file (SarjeantsMaterialsReady.xlsx)
+ * 1. Mix list file (mix-list.csv or Excel)
+ * 2. Materials lookup file (completed materials file)
  * 
  * Rules:
  * - Plant duplication: 01, 02, 03, 05, 06
@@ -149,7 +149,7 @@ function isZeroOrEmpty(val: any): boolean {
  * @returns 2D array in Command Series import format
  */
 export function convertMPAQMixes(mixData: any[][], materialsData?: any[][]): any[][] {
-    console.log("Starting Sarjeants Mixes conversion...");
+    console.log("Starting MPAQ Mixes conversion...");
     console.log("Mix data rows:", mixData.length);
     if (materialsData) {
         console.log("Materials data rows:", materialsData.length);

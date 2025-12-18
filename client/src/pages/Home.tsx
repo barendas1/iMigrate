@@ -22,7 +22,6 @@ const DISPATCH_OPTIONS = [
   "Integra", 
   "Jonel", 
   "MPAQ",
-  "Sarjeants",
   "Simma", 
   "SysDyne", 
   "WMC"
@@ -59,9 +58,9 @@ export default function Home() {
       return;
     }
     
-    // For mixes tab, allow 1-2 files (2 for Sarjeants: mix file + materials lookup)
+    // For mixes tab, allow 1-2 files (2 for MPAQ: mix file + materials lookup)
     if (activeTab === "mixes" && validFiles.length > 2) {
-      setError("Mix imports support up to 2 files (mix file + materials lookup for Sarjeants)");
+      setError("Mix imports support up to 2 files (mix file + materials lookup for MPAQ)");
       setFiles(validFiles.slice(0, 2));
       return;
     }
@@ -141,10 +140,10 @@ export default function Home() {
       let processedData: any[][] = [];
 
       if (activeTab === "mixes") {
-        // Mixes: can be 1 file (MPAQ) or 2 files (Sarjeants: mix + materials)
-        if (selectedDispatch === "Sarjeants") {
+        // Mixes: MPAQ requires 2 files (mix + materials lookup)
+        if (selectedDispatch === "MPAQ") {
           if (files.length < 2) {
-            throw new Error("Sarjeants conversion requires 2 files: mix file and materials lookup file");
+            throw new Error("MPAQ mix conversion requires 2 files: mix file and materials lookup file");
           }
           // Load both files
           const mixData = await fileToArray(files[0]);
@@ -153,10 +152,11 @@ export default function Home() {
           console.log("Materials data loaded:", materialsData.length, "rows");
           processedData = convertMPAQMixes(mixData, materialsData);
         } else {
-          // MPAQ or other: single file
+          // Other dispatch systems: single file (fallback)
           const jsonData = await fileToArray(files[0]);
           console.log("Mix data loaded:", jsonData.length, "rows");
-          processedData = convertMPAQMixes(jsonData);
+          // For non-MPAQ systems, use old converter logic or throw error
+          throw new Error(`Mix conversion for ${selectedDispatch} is not yet implemented. Please use MPAQ.`);
         }
         
       } else if (activeTab === "materials") {

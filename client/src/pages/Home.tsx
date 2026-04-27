@@ -1,227 +1,213 @@
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
-import { AlertCircle, CheckCircle2, Download, Eye, FileSpreadsheet, Loader2, Upload, UploadCloud, X } from "lucide-react";
+import {
+  AlertCircle,
+  AlertTriangle,
+  CheckCircle2,
+  Download,
+  Eye,
+  FileSpreadsheet,
+  Loader2,
+  RefreshCw,
+  Upload,
+  UploadCloud,
+  X,
+} from "lucide-react";
 import { PreviewSection } from "@/components/PreviewSection";
 import { AIModificationPanel } from "@/components/AIModificationPanel";
+import { AIMixConversionPanel } from "@/components/AIMixConversionPanel";
 import { useCallback, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import * as XLSX from "xlsx";
 import { saveAs } from "file-saver";
-import { convertMPAQMaterials, convertMPAQMaterialsMultiSheet } from "../converters/materials/MPAQ";
-import { convertMPAQMixes } from "../converters/mixes/MPAQ";
+import { convertAndMergeMaterials, revalidateMaterialWorkbook } from "../converters/materials/universal";
+import { convertAndMergeMixes, buildMaterialsLookup } from "../converters/mixes/universal";
+import type { ValidationIssue } from "../converters/materials/universal";
 
-// Dispatch system options
-const DISPATCH_OPTIONS = [
-  "BCMI", 
-  "Command Cloud", 
-  "Command Series", 
-  "Integra", 
-  "Jonel", 
-  "MPAQ",
-  "Simma", 
-  "SysDyne", 
-  "WMC"
-];
+interface ApprovedFile {
+  workbook: XLSX.WorkBook;
+  customerName: string;
+  approvedAt: string;
+  rowCount: number;
+}
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState("materials");
-  const [selectedDispatch, setSelectedDispatch] = useState<string>("");
   const [customerName, setCustomerName] = useState<string>("");
-  const [files, setFiles] = useState<File[]>([]); // Changed from single file to array
+  const [files, setFiles] = useState<File[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
   const [convertedData, setConvertedData] = useState<any>(null);
   const [originalConvertedData, setOriginalConvertedData] = useState<any>(null);
   const [showInlinePreview, setShowInlinePreview] = useState(false);
+  const [validationIssues, setValidationIssues] = useState<ValidationIssue[]>([]);
+  const [conversionStats, setConversionStats] = useState<{
+    totalInput: number;
+    totalOutput: number;
+    skipped: number;
+  } | null>(null);
 
-  // File drop handler - supports multiple files
-  const onDrop = useCallback((acceptedFiles: File[]) => {
-    setError(null);
-    setSuccess(false);
-    setConvertedData(null);
-    setShowInlinePreview(false);
-    
-    // Filter valid files
-    const validFiles = acceptedFiles.filter(file => 
-      file.name.endsWith('.xlsx') || 
-      file.name.endsWith('.xls') || 
-      file.name.endsWith('.csv')
-    );
-    
-    if (validFiles.length === 0) {
-      setError("Please upload valid Excel or CSV files (.xlsx, .xls, .csv)");
-      return;
-    }
-    
-    // For mixes tab, allow 1-2 files (2 for MPAQ: mix file + materials lookup)
-    if (activeTab === "mixes" && validFiles.length > 2) {
-      setError("Mix imports support up to 2 files (mix file + materials lookup for MPAQ)");
-      setFiles(validFiles.slice(0, 2));
-      return;
-    }
-    
-    // For materials tab, allow up to 5 files
-    if (activeTab === "materials" && validFiles.length > 5) {
-      setError("Maximum 5 files allowed");
-      setFiles(validFiles.slice(0, 5));
-      return;
-    }
-    
-    setFiles(validFiles);
-  }, [activeTab]);
+  // Approved files queued for upload (persist across tab switches)
+  const [approvedMaterials, setApprovedMaterials] = useState<ApprovedFile | null>(null);
+  const [approvedMixes, setApprovedMixes] = useState<ApprovedFile | null>(null);
 
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({ 
+  // ── File drop ──────────────────────────────────────────────────────────────
+  const onDrop = useCallback(
+    (acceptedFiles: File[]) => {
+      setError(null);
+      setSuccess(false);
+      setConvertedData(null);
+      setShowInlinePreview(false);
+      setValidationIssues([]);
+      setConversionStats(null);
+
+      const validFiles = acceptedFiles.filter(
+        (f) =>
+          f.name.endsWith(".xlsx") ||
+          f.name.endsWith(".xls") ||
+          f.name.endsWith(".csv")
+      );
+
+      if (validFiles.length === 0) {
+        setError("Please upload valid Excel or CSV files (.xlsx, .xls, .csv)");
+        return;
+      }
+
+      setFiles(validFiles);
+    },
+    [activeTab]
+  );
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: {
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
-      'application/vnd.ms-excel': ['.xls'],
-      'text/csv': ['.csv']
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+      "application/vnd.ms-excel": [".xls"],
+      "text/csv": [".csv"],
     },
-    maxFiles: activeTab === "mixes" ? 2 : 5,
-    multiple: true
+    multiple: true,
   });
 
-  // Remove a specific file
-  const removeFile = (index: number) => {
-    setFiles(prev => prev.filter((_, i) => i !== index));
+  const resetState = () => {
+    setFiles([]);
     setSuccess(false);
     setConvertedData(null);
     setShowInlinePreview(false);
+    setValidationIssues([]);
+    setConversionStats(null);
+    setError(null);
   };
 
-  // Helper function to read a file as array buffer
-  const readFileAsArrayBuffer = (file: File): Promise<ArrayBuffer> => {
-    return new Promise((resolve, reject) => {
+  const removeFile = (index: number) => {
+    setFiles((prev) => prev.filter((_, i) => i !== index));
+    setSuccess(false);
+    setConvertedData(null);
+    setShowInlinePreview(false);
+    setValidationIssues([]);
+    setConversionStats(null);
+  };
+
+  // ── File reader helpers ────────────────────────────────────────────────────
+  const readFileAsArrayBuffer = (file: File): Promise<ArrayBuffer> =>
+    new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = (e) => resolve(e.target?.result as ArrayBuffer);
       reader.onerror = reject;
       reader.readAsArrayBuffer(file);
     });
-  };
 
-  // Helper function to convert file to 2D array
   const fileToArray = async (file: File): Promise<any[][]> => {
     const arrayBuffer = await readFileAsArrayBuffer(file);
-    
+
     if (file.name.toLowerCase().endsWith(".csv")) {
       const text = new TextDecoder().decode(arrayBuffer);
       const csvData = XLSX.read(text, { type: "string" });
       const sheet = csvData.Sheets[csvData.SheetNames[0]];
       return XLSX.utils.sheet_to_json(sheet, { header: 1 }) as any[][];
     } else {
-      const workbook = XLSX.read(arrayBuffer, { type: 'array' });
-      // Try to find the data sheet
-      let sheetName = workbook.SheetNames.find(name => 
-        name.toLowerCase().includes('mix') || 
-        name.toLowerCase().includes('material') ||
-        name.toLowerCase().includes('data')
+      const workbook = XLSX.read(arrayBuffer, { type: "array" });
+      let sheetName = workbook.SheetNames.find((name) =>
+        /mix|material|data/i.test(name)
       );
       if (!sheetName) {
-        sheetName = workbook.SheetNames.length > 1 ? workbook.SheetNames[1] : workbook.SheetNames[0];
+        sheetName =
+          workbook.SheetNames.length > 1
+            ? workbook.SheetNames[1]
+            : workbook.SheetNames[0];
       }
       const worksheet = workbook.Sheets[sheetName];
       return XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as any[][];
     }
   };
 
-  // Conversion logic
+  // ── Conversion ─────────────────────────────────────────────────────────────
   const handleConvert = async () => {
-    if (files.length === 0 || !selectedDispatch) return;
-    
+    if (files.length === 0) return;
+
     setIsProcessing(true);
     setError(null);
+    setValidationIssues([]);
+    setConversionStats(null);
 
     try {
-      let processedData: any[][] = [];
+      let processedRows: any[][] = [];
+      let issues: ValidationIssue[] = [];
+      let stats = { totalInput: 0, totalOutput: 0, skipped: 0 };
 
-      if (activeTab === "mixes") {
-        // Mixes: MPAQ requires 2 files (mix + materials lookup)
-        if (selectedDispatch === "MPAQ") {
-          if (files.length < 2) {
-            throw new Error("MPAQ mix conversion requires 2 files: mix file and materials lookup file");
-          }
-          // Load both files
-          const mixData = await fileToArray(files[0]);
-          const materialsData = await fileToArray(files[1]);
-          console.log("Mix data loaded:", mixData.length, "rows");
-          console.log("Materials data loaded:", materialsData.length, "rows");
-          processedData = convertMPAQMixes(mixData, materialsData);
-        } else {
-          // Other dispatch systems: single file (fallback)
-          const jsonData = await fileToArray(files[0]);
-          console.log("Mix data loaded:", jsonData.length, "rows");
-          // For non-MPAQ systems, use old converter logic or throw error
-          throw new Error(`Mix conversion for ${selectedDispatch} is not yet implemented. Please use MPAQ.`);
+      if (activeTab === "materials") {
+        const filePayloads = await Promise.all(
+          files.map(async (f) => ({ data: await fileToArray(f), fileName: f.name }))
+        );
+        const result = convertAndMergeMaterials(filePayloads);
+        processedRows = result.rows;
+        issues = result.issues;
+        stats = {
+          totalInput: result.totalInputRows,
+          totalOutput: result.totalOutputRows,
+          skipped: result.skippedRows,
+        };
+      } else if (activeTab === "mixes") {
+        let mixFiles = files;
+        let materialsLookup = new Map<string, string>();
+
+        const lastFile = files[files.length - 1];
+        const lastIsMaterialsLookup =
+          files.length > 1 &&
+          /material|mat_lookup|materials/i.test(lastFile.name);
+
+        if (lastIsMaterialsLookup) {
+          const lookupData = await fileToArray(lastFile);
+          materialsLookup = buildMaterialsLookup(lookupData);
+          mixFiles = files.slice(0, -1);
         }
-        
-      } else if (activeTab === "materials") {
-        // Materials: can handle 1-5 files
-        if (files.length === 1) {
-          // Single file - could be combined or single material type
-          const jsonData = await fileToArray(files[0]);
-          console.log("Material data loaded:", jsonData.length, "rows");
-          processedData = convertMPAQMaterials(jsonData);
-          
-        } else {
-          // Multiple files - treat as separate material types
-          console.log(`Processing ${files.length} material files...`);
-          
-          // Read all files
-          const fileDataPromises = files.map(file => fileToArray(file));
-          const allFileData = await Promise.all(fileDataPromises);
-          
-          // Try to identify which file is which based on filename
-          let admixData: any[][] | null = null;
-          let aggregateData: any[][] | null = null;
-          let cementData: any[][] | null = null;
-          
-          files.forEach((file, index) => {
-            const fileName = file.name.toLowerCase();
-            const data = allFileData[index];
-            
-            if (fileName.includes('admix') || fileName.includes('fiber')) {
-              admixData = data;
-              console.log("Identified admix file:", file.name);
-            } else if (fileName.includes('aggregate') || fileName.includes('agg')) {
-              aggregateData = data;
-              console.log("Identified aggregate file:", file.name);
-            } else if (fileName.includes('cement') || fileName.includes('cem')) {
-              cementData = data;
-              console.log("Identified cement file:", file.name);
-            } else {
-              // If we can't identify by name, assign in order
-              if (!admixData) {
-                admixData = data;
-                console.log("Assigned to admix (by order):", file.name);
-              } else if (!aggregateData) {
-                aggregateData = data;
-                console.log("Assigned to aggregate (by order):", file.name);
-              } else if (!cementData) {
-                cementData = data;
-                console.log("Assigned to cement (by order):", file.name);
-              }
-            }
-          });
-          
-          processedData = convertMPAQMaterialsMultiSheet(admixData, aggregateData, cementData);
-        }
+
+        const filePayloads = await Promise.all(
+          mixFiles.map(async (f) => ({ data: await fileToArray(f), fileName: f.name }))
+        );
+        const result = convertAndMergeMixes(filePayloads, materialsLookup);
+        processedRows = result.rows;
+        issues = result.issues;
+        stats = {
+          totalInput: result.totalInputMixes,
+          totalOutput: result.totalOutputRows,
+          skipped: result.skippedMixes,
+        };
       }
 
-      // Create workbook for export
       const newWb = XLSX.utils.book_new();
-      const newWs = XLSX.utils.aoa_to_sheet(processedData);
-      const outputSheetName = activeTab === "mixes" ? "Mix Import" : "Material Import";
-      XLSX.utils.book_append_sheet(newWb, newWs, outputSheetName);
-      
+      const newWs = XLSX.utils.aoa_to_sheet(processedRows);
+      const sheetName = activeTab === "mixes" ? "Mix Import" : "Material Import";
+      XLSX.utils.book_append_sheet(newWb, newWs, sheetName);
+
       setConvertedData(newWb);
-      setOriginalConvertedData(newWb); // Save original for revert
+      setOriginalConvertedData(newWb);
+      setValidationIssues(issues);
+      setConversionStats(stats);
       setSuccess(true);
-      
     } catch (err: any) {
       console.error("Conversion error:", err);
       setError(err.message || "Error processing file(s). Please check the file format.");
@@ -230,20 +216,295 @@ export default function Home() {
     }
   };
 
-  const handleDownload = () => {
+  // ── Revalidate against current in-memory (possibly AI-modified) workbook ──
+  const handleRevalidate = () => {
     if (!convertedData) return;
-    
-    const wbout = XLSX.write(convertedData, { bookType: 'xlsx', type: 'array' });
-    const blob = new Blob([wbout], { type: 'application/octet-stream' });
-    
-    // Build filename with customer name if provided
-    const baseFilename = activeTab === "mixes" ? 'MixImport' : 'MaterialImport';
-    const customerPrefix = customerName.trim() ? `${customerName.trim()}-` : '';
-    const filename = `${customerPrefix}${baseFilename}-Converted.xlsx`;
-    
-    saveAs(blob, filename);
+
+    setIsProcessing(true);
+    setError(null);
+
+    try {
+      // Extract rows from the current workbook (first sheet)
+      const sheetName = convertedData.SheetNames[0];
+      const ws = convertedData.Sheets[sheetName];
+      const rows: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
+
+      if (activeTab === "materials") {
+        const result = revalidateMaterialWorkbook(rows);
+        setValidationIssues(result.issues);
+        // Update stats to reflect the current workbook state
+        setConversionStats((prev) => ({
+          totalInput: prev?.totalInput ?? result.totalRows,
+          totalOutput: result.totalRows,
+          skipped: prev?.skipped ?? 0,
+        }));
+      }
+      // Mixes revalidation: for now just clear issues (mixes don't have the same
+      // strict SG / duplicate checks — extend here when needed)
+    } catch (err: any) {
+      console.error("Revalidation error:", err);
+      setError(err.message || "Error during revalidation.");
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
+  const handleDownload = () => {
+    if (!convertedData) return;
+    const wbout = XLSX.write(convertedData, { bookType: "xlsx", type: "array" });
+    const blob = new Blob([wbout], { type: "application/octet-stream" });
+    const base = activeTab === "mixes" ? "MixImport" : "MaterialImport";
+    const prefix = customerName.trim() ? `${customerName.trim()}-` : "";
+    saveAs(blob, `${prefix}${base}-Converted.xlsx`);
+  };
+
+  const handleDownloadApproved = (approved: ApprovedFile, type: "Material" | "Mix") => {
+    const wbout = XLSX.write(approved.workbook, { bookType: "xlsx", type: "array" });
+    const blob = new Blob([wbout], { type: "application/octet-stream" });
+    const prefix = approved.customerName ? `${approved.customerName}-` : "";
+    saveAs(blob, `${prefix}${type}Import-Approved.xlsx`);
+  };
+
+  const handleApprove = () => {
+    if (!convertedData) return;
+    const sheetName = convertedData.SheetNames[0];
+    const ws = convertedData.Sheets[sheetName];
+    const rows: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
+    const rowCount = Math.max(0, rows.length - 1); // exclude header
+
+    const approved: ApprovedFile = {
+      workbook: convertedData,
+      customerName: customerName.trim() || "Unknown",
+      approvedAt: new Date().toLocaleString(),
+      rowCount,
+    };
+
+    if (activeTab === "materials") {
+      setApprovedMaterials(approved);
+    } else if (activeTab === "mixes") {
+      setApprovedMixes(approved);
+    }
+    setActiveTab("mix-material");
+  };
+
+  // ── Derived counts ─────────────────────────────────────────────────────────
+  const errorCount = validationIssues.filter((i) => i.type === "error").length;
+  const warnCount = validationIssues.filter((i) => i.type === "warning").length;
+
+  // ── Reusable JSX blocks (not nested components — avoids remount issue) ─────
+
+  // File list shown inside the dropzone (display only, no action buttons)
+  const fileListJSX = (
+    <>
+      <div className="w-14 h-14 rounded-full bg-success/10 flex items-center justify-center text-success">
+        <FileSpreadsheet className="h-7 w-7" />
+      </div>
+      <div className="w-full space-y-2">
+        <p className="text-lg font-semibold text-dark">
+          {files.length} file{files.length !== 1 ? "s" : ""} selected
+        </p>
+        {files.map((file, index) => (
+          <div
+            key={index}
+            className="flex items-center justify-between bg-white rounded-lg p-2.5 border border-border"
+          >
+            <div className="flex items-center gap-3 min-w-0 flex-1">
+              <FileSpreadsheet className="h-4 w-4 text-muted-foreground shrink-0" />
+              <div className="text-left min-w-0">
+                <p className="text-sm font-medium text-dark truncate">{file.name}</p>
+                <p className="text-xs text-muted-foreground">
+                  {(file.size / 1024).toFixed(2)} KB
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              className="h-8 w-8 flex items-center justify-center rounded text-destructive hover:bg-destructive/10 shrink-0"
+              onClick={(e) => {
+                e.stopPropagation();
+                removeFile(index);
+              }}
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        ))}
+        {files.length > 1 && (
+          <button
+            type="button"
+            className="text-sm text-destructive hover:underline mt-1"
+            onClick={(e) => {
+              e.stopPropagation();
+              resetState();
+            }}
+          >
+            Remove All Files
+          </button>
+        )}
+      </div>
+    </>
+  );
+
+  const emptyDropzoneJSX = (
+    <>
+      <div className="w-14 h-14 rounded-full bg-secondary/10 flex items-center justify-center text-secondary">
+        <UploadCloud className="h-7 w-7" />
+      </div>
+      <div>
+        <p className="text-lg font-medium text-dark">Drag & drop your files here</p>
+        <p className="text-sm text-muted-foreground mt-1">
+          or click to browse from your computer
+        </p>
+      </div>
+      <p className="text-xs text-muted-foreground/70">
+        Supported formats: .xlsx, .xls, .csv
+      </p>
+    </>
+  );
+
+  // Error / success banners (rendered outside the dropzone)
+  const statusBannerJSX = (
+    <>
+      {error && (
+        <div className="bg-destructive/10 border border-destructive/20 rounded-lg p-3 flex items-start gap-3 text-destructive mt-3">
+          <AlertCircle className="h-5 w-5 mt-0.5 shrink-0" />
+          <div>
+            <p className="font-medium">Error</p>
+            <p className="text-sm opacity-90">{error}</p>
+          </div>
+        </div>
+      )}
+      {success && (
+        <div className="bg-success/10 border border-success/20 rounded-lg p-3 flex items-start gap-3 text-success mt-3">
+          <CheckCircle2 className="h-5 w-5 mt-0.5 shrink-0" />
+          <div>
+            <p className="font-medium">Conversion Successful!</p>
+            {conversionStats && (
+              <div className="flex flex-wrap gap-4 text-sm mt-1 opacity-90">
+                <span><strong>{conversionStats.totalInput}</strong> input rows</span>
+                <span><strong>{conversionStats.totalOutput}</strong> output rows</span>
+                {conversionStats.skipped > 0 && (
+                  <span><strong>{conversionStats.skipped}</strong> skipped</span>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  );
+
+  // Validation panel (rendered outside the dropzone)
+  const validationPanelJSX = validationIssues.length > 0 ? (
+    <div className="mt-3 rounded-lg border border-border overflow-hidden">
+      <div className="bg-secondary/10 px-4 py-2 flex items-center gap-3 border-b border-border">
+        {errorCount > 0 && (
+          <span className="flex items-center gap-1.5 text-destructive text-sm font-medium">
+            <AlertCircle className="h-4 w-4" />
+            {errorCount} error{errorCount !== 1 ? "s" : ""}
+          </span>
+        )}
+        {warnCount > 0 && (
+          <span className="flex items-center gap-1.5 text-yellow-600 text-sm font-medium">
+            <AlertTriangle className="h-4 w-4" />
+            {warnCount} warning{warnCount !== 1 ? "s" : ""}
+          </span>
+        )}
+        <span className="ml-auto text-xs text-muted-foreground">Validation Results</span>
+      </div>
+      <ul className="max-h-48 overflow-y-auto divide-y divide-border">
+        {validationIssues.map((issue, idx) => (
+          <li
+            key={idx}
+            className={cn(
+              "px-4 py-2 text-xs flex items-start gap-2",
+              issue.type === "error"
+                ? "text-destructive bg-destructive/5"
+                : "text-yellow-700 bg-yellow-50"
+            )}
+          >
+            {issue.type === "error" ? (
+              <AlertCircle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+            ) : (
+              <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+            )}
+            <span>{issue.message}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  ) : null;
+
+  // Action buttons (always rendered outside the dropzone)
+  const actionButtonsJSX = (
+    <div className="flex items-center justify-end gap-3 mt-4">
+      {success ? (
+        <>
+          <Button
+            size="lg"
+            variant="outline"
+            className="border-primary text-primary hover:bg-primary/5 shadow-md hover:shadow-lg transition-all"
+            onClick={() => setShowInlinePreview(!showInlinePreview)}
+          >
+            <Eye className="mr-2 h-5 w-5" />
+            {showInlinePreview ? "Hide Preview" : "Preview"}
+          </Button>
+          <Button
+            size="lg"
+            variant="outline"
+            className="border-yellow-500 text-yellow-600 hover:bg-yellow-50 shadow-md hover:shadow-lg transition-all"
+            disabled={isProcessing || !convertedData}
+            onClick={handleRevalidate}
+          >
+            {isProcessing ? (
+              <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+            ) : (
+              <RefreshCw className="mr-2 h-5 w-5" />
+            )}
+            Revalidate
+          </Button>
+          <Button
+            size="lg"
+            variant="outline"
+            className="border-success text-success hover:bg-success/5 shadow-md hover:shadow-lg transition-all"
+            onClick={handleDownload}
+          >
+            <Download className="mr-2 h-5 w-5" />
+            Download
+          </Button>
+          <Button
+            size="lg"
+            className="bg-success hover:bg-success2 text-white shadow-md hover:shadow-lg transition-all"
+            onClick={handleApprove}
+          >
+            <CheckCircle2 className="mr-2 h-5 w-5" />
+            Approve & Queue for Upload
+          </Button>
+        </>
+      ) : (
+        <Button
+          size="lg"
+          className={cn(
+            "bg-primary hover:bg-primary-hover text-white shadow-md hover:shadow-lg transition-all",
+            files.length === 0 && "opacity-50 cursor-not-allowed"
+          )}
+          disabled={files.length === 0 || isProcessing}
+          onClick={handleConvert}
+        >
+          {isProcessing ? (
+            <>
+              <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+              Processing...
+            </>
+          ) : (
+            "Convert Data"
+          )}
+        </Button>
+      )}
+    </div>
+  );
+
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-background pb-20">
       {/* Header */}
@@ -261,290 +522,63 @@ export default function Home() {
         </div>
       </header>
 
-      <main className="container mt-8">
-        <div className="max-w-7xl mx-auto">
+      <main className="mt-8 px-[5%]">
+        <div className="w-full">
           <div className="mb-8 text-center">
-            <h2 className="text-3xl font-bold text-dark mb-2">Import, Convert, & Upload Data</h2>
+            <h2 className="text-3xl font-bold text-dark mb-2">
+              Import, Convert, & Upload Data
+            </h2>
             <p className="text-muted-foreground">
               Upload exported customer mixes and materials to convert into Quadrel standard import format.
             </p>
           </div>
 
-          <Tabs defaultValue="materials" value={activeTab} onValueChange={(val) => {
-            setActiveTab(val);
-            setFiles([]); // Clear files when switching tabs
-            setError(null);
-            setSuccess(false);
-            setConvertedData(null);
-            setShowInlinePreview(false);
-          }} className="w-full">
+          <Tabs
+            defaultValue="materials"
+            value={activeTab}
+            onValueChange={(val) => {
+              setActiveTab(val);
+              resetState();
+            }}
+            className="w-full"
+          >
             <TabsList className="grid w-full grid-cols-3 bg-secondary/20 p-1 rounded-xl mb-6 h-auto">
-              <TabsTrigger 
-                value="materials" 
+              <TabsTrigger
+                value="materials"
                 className="rounded-lg text-base font-medium data-[state=active]:bg-white data-[state=active]:text-primary data-[state=active]:shadow-sm h-8 transition-all"
               >
                 Material Conversion
               </TabsTrigger>
-              <TabsTrigger 
-                value="mixes" 
+              <TabsTrigger
+                value="mixes"
                 className="rounded-lg text-base font-medium data-[state=active]:bg-white data-[state=active]:text-primary data-[state=active]:shadow-sm h-8 transition-all"
               >
                 Mix Conversion
               </TabsTrigger>
-              <TabsTrigger 
-                value="mix-material" 
+              <TabsTrigger
+                value="mix-material"
                 className="rounded-lg text-base font-medium data-[state=active]:bg-white data-[state=active]:text-primary data-[state=active]:shadow-sm h-8 transition-all"
               >
                 Mix & Material Upload
               </TabsTrigger>
             </TabsList>
 
-            <TabsContent value="mixes" className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            {/* ── MATERIALS TAB ─────────────────────────────────────────── */}
+            <TabsContent
+              value="materials"
+              className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500"
+            >
               <Card className="border-border shadow-sm overflow-hidden">
                 <CardHeader className="bg-secondary/1 border-b border-border pb-4">
                   <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
                     <div className="flex-1">
-                      <CardTitle className="text-xl text-secondary mb-1">Mix Conversion</CardTitle>
-                      <CardDescription>Upload 2 files for MPAQ: mix file and materials lookup file.</CardDescription>
+                      <CardTitle className="text-xl text-secondary mb-1">
+                        Material Conversion
+                      </CardTitle>
+                      <CardDescription>
+                        Upload one or more material files. All files will be merged into a single output.
+                      </CardDescription>
                     </div>
-                    
-                    <div className="flex gap-2">
-                      <input
-                        type="file"
-                        id="file-upload"
-                        className="hidden"
-                        accept=".xlsx,.xls,.csv"
-                        multiple
-                        onChange={(e) => {
-                          if (e.target.files && e.target.files.length > 0) {
-                            onDrop(Array.from(e.target.files));
-                          }
-                        }}
-                      />
-                      <Button 
-                        variant="outline" 
-                        className="border-primary text-primary hover:bg-primary/5 hover:text-primary-hover"
-                        onClick={() => document.getElementById('file-upload')?.click()}
-                      >
-                        <Upload className="mr-2 h-4 w-4" />
-                        Select Files
-                      </Button>
-                    </div>
-                  </div>
-                  
-                  {/* Configuration Fields */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4 pt-4 border-t border-border">
-                    <div className="space-y-1.5">
-                      <label className="text-sm font-medium text-dark">Customer Name</label>
-                      <Input
-                        type="text"
-                        placeholder="Enter customer name (optional)"
-                        value={customerName}
-                        onChange={(e) => setCustomerName(e.target.value.slice(0, 16))}
-                        maxLength={16}
-                        className="w-full h-10 text-base"
-                      />
-                      <p className="text-xs text-muted-foreground">Max 16 characters. Will be added to output filename.</p>
-                    </div>
-                    <div className="space-y-1.5">
-                      <label className="text-sm font-medium text-dark">Dispatch System</label>
-                      <Select value={selectedDispatch} onValueChange={setSelectedDispatch}>
-                        <SelectTrigger className="w-full h-10 text-base bg-white border-border focus:ring-primary/20">
-                          <SelectValue placeholder="Select Dispatch System" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {DISPATCH_OPTIONS.map((option) => (
-                            <SelectItem 
-                              key={option} 
-                              value={option}
-                              disabled={option !== "MPAQ"}
-                              className="cursor-pointer py-3"
-                            >
-                              <span className={cn(option !== "MPAQ" && "opacity-50")}>
-                                {option} {option !== "MPAQ" && "(Coming Soon)"}
-                              </span>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-                </CardHeader>
-                
-                <CardContent className="pt-4 space-y-4">
-                  <div 
-                    {...getRootProps()} 
-                    className={cn(
-                      "border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all duration-200 flex flex-col items-center justify-center gap-3 min-h-[180px]",
-                      isDragActive ? "border-primary bg-primary/5 scale-[0.99]" : "border-border hover:border-primary/50 hover:bg-secondary/5",
-                      files.length > 0 ? "bg-secondary/5 border-secondary/30" : ""
-                    )}
-                  >
-                    <input {...getInputProps()} />
-                    
-                    {files.length > 0 ? (
-                      <>
-                        <div className="w-14 h-14 rounded-full bg-success/10 flex items-center justify-center text-success">
-                          <FileSpreadsheet className="h-7 w-7" />
-                        </div>
-                        <div className="w-full space-y-2">
-                          <p className="text-lg font-medium text-dark">{files.length} file{files.length > 1 ? 's' : ''} selected</p>
-                          <div className="space-y-2">
-                            {files.map((file, index) => (
-                              <div key={index} className="flex items-center justify-between bg-white rounded-lg p-2 border border-border">
-                                <div className="flex items-center gap-2 flex-1 min-w-0">
-                                  <FileSpreadsheet className="h-4 w-4 text-secondary shrink-0" />
-                                  <div className="min-w-0 flex-1">
-                                    <p className="text-sm font-medium text-dark truncate">{file.name}</p>
-                                    <p className="text-xs text-muted-foreground">{(file.size / 1024).toFixed(2)} KB</p>
-                                  </div>
-                                </div>
-                                <Button 
-                                  variant="ghost" 
-                                  size="sm" 
-                                  className="text-destructive hover:text-destructive hover:bg-destructive/10 h-8 w-8 p-0 shrink-0"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    removeFile(index);
-                                  }}
-                                >
-                                  <X className="h-4 w-4" />
-                                </Button>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                        <Button 
-                          variant="ghost" 
-                          size="sm" 
-                          className="text-destructive hover:text-destructive hover:bg-destructive/10"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setFiles([]);
-                            setSuccess(false);
-                            setConvertedData(null);
-                          }}
-                        >
-                          Remove All Files
-                        </Button>
-                      </>
-                    ) : (
-                      <>
-                        <div className="w-14 h-14 rounded-full bg-secondary/10 flex items-center justify-center text-secondary">
-                          <UploadCloud className="h-7 w-7" />
-                        </div>
-                        <div>
-                          <p className="text-lg font-medium text-dark">Drag & drop your files here</p>
-                          <p className="text-sm text-muted-foreground mt-1">or click to browse (select up to 2 files for MPAQ)</p>
-                        </div>
-                        <p className="text-xs text-muted-foreground/70">Supported formats: .xlsx, .xls, .csv</p>
-                      </>
-                    )}
-                    
-                    {error && (
-                      <div className="bg-destructive/10 border border-destructive/20 rounded-lg p-3 flex items-start gap-3 text-destructive animate-in fade-in slide-in-from-top-2 mt-2 w-full">
-                        <AlertCircle className="h-5 w-5 mt-0.5 shrink-0" />
-                        <div>
-                          <p className="font-medium">Error</p>
-                          <p className="text-sm opacity-90">{error}</p>
-                        </div>
-                      </div>
-                    )}
-
-                    {success && (
-                      <div className="bg-success/10 border border-success/20 rounded-lg p-3 flex items-start gap-3 text-success animate-in fade-in slide-in-from-top-2 mt-2 w-full">
-                        <CheckCircle2 className="h-5 w-5 mt-0.5 shrink-0" />
-                        <div>
-                          <p className="font-medium">Conversion Successful!</p>
-                          <p className="text-sm opacity-90">Your file has been processed and is ready for download.</p>
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="flex items-center justify-end gap-3 pt-3 mt-2 w-full">
-                    {success ? (
-                      <>
-                        <Button 
-                          size="lg" 
-                          variant="outline"
-                          className="border-primary text-primary hover:bg-primary/5 shadow-md hover:shadow-lg transition-all"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setShowInlinePreview(!showInlinePreview);
-                          }}
-                        >
-                          <Eye className="mr-2 h-5 w-5" />
-                          {showInlinePreview ? 'Hide Preview' : 'Preview'}
-                        </Button>
-                        <Button 
-                          size="lg" 
-                          className="bg-success hover:bg-success2 text-white shadow-md hover:shadow-lg transition-all w-full sm:w-auto"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDownload();
-                          }}
-                        >
-                          <Download className="mr-2 h-5 w-5" />
-                          Download Converted File
-                        </Button>
-                      </>
-                    ) : (
-                      <Button 
-                        size="lg" 
-                        className={cn(
-                          "bg-primary hover:bg-primary-hover text-white shadow-md hover:shadow-lg transition-all w-full sm:w-auto",
-                          (files.length === 0 || !selectedDispatch) && "opacity-50 cursor-not-allowed"
-                        )}
-                        disabled={files.length === 0 || !selectedDispatch || isProcessing}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleConvert();
-                        }}
-                      >
-                        {isProcessing ? (
-                          <>
-                            <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                            Processing...
-                          </>
-                        ) : (
-                          <>
-                            Convert Data
-                          </>
-                        )}
-                      </Button>
-                    )}
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-              
-              {/* Inline Preview Section */}
-              {success && showInlinePreview && (
-                <PreviewSection
-                  workbook={convertedData}
-                  title="Mix Import Preview"
-                  onClose={() => setShowInlinePreview(false)}
-                  onDataChange={(modifiedWorkbook) => setConvertedData(modifiedWorkbook)}
-                >
-                  <AIModificationPanel
-                    workbook={convertedData}
-                    originalWorkbook={originalConvertedData}
-                    onModify={(modifiedWorkbook) => setConvertedData(modifiedWorkbook)}
-                    onRevert={() => setConvertedData(originalConvertedData)}
-                  />
-                </PreviewSection>
-              )}
-            </TabsContent>
-            
-            <TabsContent value="materials" className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
-              <Card className="border-border shadow-sm overflow-hidden">
-                <CardHeader className="bg-secondary/1 border-b border-border pb-4">
-                  <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
-                    <div className="flex-1">
-                      <CardTitle className="text-xl text-secondary mb-1">Material Conversion</CardTitle>
-                      <CardDescription>Upload material files (up to 5).</CardDescription>
-                    </div>
-                    
                     <div className="flex gap-2">
                       <input
                         type="file"
@@ -558,18 +592,19 @@ export default function Home() {
                           }
                         }}
                       />
-                      <Button 
-                        variant="outline" 
+                      <Button
+                        variant="outline"
                         className="border-primary text-primary hover:bg-primary/5 hover:text-primary-hover"
-                        onClick={() => document.getElementById('file-upload-materials')?.click()}
+                        onClick={() =>
+                          document.getElementById("file-upload-materials")?.click()
+                        }
                       >
                         <Upload className="mr-2 h-4 w-4" />
                         Select Files
                       </Button>
                     </div>
                   </div>
-                  
-                  {/* Configuration Fields */}
+
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4 pt-4 border-t border-border">
                     <div className="space-y-1.5">
                       <label className="text-sm font-medium text-dark">Customer Name</label>
@@ -581,202 +616,318 @@ export default function Home() {
                         maxLength={16}
                         className="w-full h-10 text-base"
                       />
-                      <p className="text-xs text-muted-foreground">Max 16 characters. Will be added to output filename.</p>
-                    </div>
-                    <div className="space-y-1.5">
-                      <label className="text-sm font-medium text-dark">Dispatch System</label>
-                      <Select value={selectedDispatch} onValueChange={setSelectedDispatch}>
-                        <SelectTrigger className="w-full h-10 text-base bg-white border-border focus:ring-primary/20">
-                          <SelectValue placeholder="Select Dispatch System" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {DISPATCH_OPTIONS.map((option) => (
-                            <SelectItem 
-                              key={option} 
-                              value={option}
-                              disabled={option !== "MPAQ"}
-                              className="cursor-pointer py-3"
-                            >
-                              <span className={cn(option !== "MPAQ" && "opacity-50")}>
-                                {option} {option !== "MPAQ" && "(Coming Soon)"}
-                              </span>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                      <p className="text-xs text-muted-foreground">
+                        Max 16 characters. Will be added to output filename.
+                      </p>
                     </div>
                   </div>
                 </CardHeader>
-                
-                <CardContent className="pt-4 space-y-4">
-                  <div 
-                    {...getRootProps()} 
+
+                <CardContent className="pt-4 space-y-2">
+                  {/* Dropzone — display only, no action buttons inside */}
+                  <div
+                    {...getRootProps()}
                     className={cn(
                       "border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all duration-200 flex flex-col items-center justify-center gap-3 min-h-[180px]",
-                      isDragActive ? "border-primary bg-primary/5 scale-[0.99]" : "border-border hover:border-primary/50 hover:bg-secondary/5",
+                      isDragActive
+                        ? "border-primary bg-primary/5 scale-[0.99]"
+                        : "border-border hover:border-primary/50 hover:bg-secondary/5",
                       files.length > 0 ? "bg-secondary/5 border-secondary/30" : ""
                     )}
                   >
                     <input {...getInputProps()} />
-                    
-                    {files.length > 0 ? (
-                      <>
-                        <div className="w-14 h-14 rounded-full bg-success/10 flex items-center justify-center text-success">
-                          <FileSpreadsheet className="h-7 w-7" />
-                        </div>
-                        <div className="w-full space-y-2">
-                          <p className="text-lg font-semibold text-dark">{files.length} file(s) selected</p>
-                          {files.map((file, index) => (
-                            <div key={index} className="flex items-center justify-between bg-white rounded-lg p-2.5 border border-border">
-                              <div className="flex items-center gap-3">
-                                <FileSpreadsheet className="h-4 w-4 text-muted-foreground" />
-                                <div className="text-left">
-                                  <p className="text-sm font-medium text-dark">{file.name}</p>
-                                  <p className="text-xs text-muted-foreground">{(file.size / 1024).toFixed(2)} KB</p>
-                                </div>
-                              </div>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="h-8 w-8 p-0 text-destructive hover:text-destructive hover:bg-destructive/10"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  removeFile(index);
-                                }}
-                              >
-                                <X className="h-4 w-4" />
-                              </Button>
-                            </div>
-                          ))}
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <div className="w-14 h-14 rounded-full bg-secondary/10 flex items-center justify-center text-secondary">
-                          <UploadCloud className="h-7 w-7" />
-                        </div>
-                        <div>
-                          <p className="text-lg font-medium text-dark">Drag & drop your files here</p>
-                          <p className="text-sm text-muted-foreground mt-1">or click to browse from your computer</p>
-                        </div>
-                        <p className="text-xs text-muted-foreground/70">
-                          Supported formats: .xlsx, .xls, .csv • Maximum 5 files
-                        </p>
-                      </>
-                    )}
-                    
-                    {error && (
-                      <div className="bg-destructive/10 border border-destructive/20 rounded-lg p-3 flex items-start gap-3 text-destructive animate-in fade-in slide-in-from-top-2 mt-2 w-full">
-                        <AlertCircle className="h-5 w-5 mt-0.5 shrink-0" />
-                        <div>
-                          <p className="font-medium">Error</p>
-                          <p className="text-sm opacity-90">{error}</p>
-                        </div>
-                      </div>
-                    )}
-
-                    {success && (
-                      <div className="bg-success/10 border border-success/20 rounded-lg p-3 flex items-start gap-3 text-success animate-in fade-in slide-in-from-top-2 mt-2 w-full">
-                        <CheckCircle2 className="h-5 w-5 mt-0.5 shrink-0" />
-                        <div>
-                          <p className="font-medium">Conversion Successful!</p>
-                          <p className="text-sm opacity-90">Your files have been processed and are ready for download.</p>
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="flex items-center justify-end gap-3 pt-3 mt-2 w-full">
-                    {success ? (
-                      <>
-                        <Button 
-                          size="lg" 
-                          variant="outline"
-                          className="border-primary text-primary hover:bg-primary/5 shadow-md hover:shadow-lg transition-all"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setShowInlinePreview(!showInlinePreview);
-                          }}
-                        >
-                          <Eye className="mr-2 h-5 w-5" />
-                          {showInlinePreview ? 'Hide Preview' : 'Preview'}
-                        </Button>
-                        <Button 
-                          size="lg" 
-                          className="bg-success hover:bg-success2 text-white shadow-md hover:shadow-lg transition-all w-full sm:w-auto"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDownload();
-                          }}
-                        >
-                          <Download className="mr-2 h-5 w-5" />
-                          Download Converted File
-                        </Button>
-                      </>
-                    ) : (
-                      <Button 
-                        size="lg" 
-                        className={cn(
-                          "bg-primary hover:bg-primary-hover text-white shadow-md hover:shadow-lg transition-all w-full sm:w-auto",
-                          (files.length === 0 || !selectedDispatch) && "opacity-50 cursor-not-allowed"
-                        )}
-                        disabled={files.length === 0 || !selectedDispatch || isProcessing}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleConvert();
-                        }}
-                      >
-                        {isProcessing ? (
-                          <>
-                            <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                            Processing...
-                          </>
-                        ) : (
-                          <>
-                            Convert Data
-                          </>
-                        )}
-                      </Button>
-                    )}
-                    </div>
+                    {files.length > 0 ? fileListJSX : emptyDropzoneJSX}
                   </div>
+
+                  {/* Status banners, validation panel, and action buttons are OUTSIDE the dropzone */}
+                  {statusBannerJSX}
+                  {validationPanelJSX}
+                  {actionButtonsJSX}
                 </CardContent>
               </Card>
-              
-              {/* Inline Preview Section */}
+
               {success && showInlinePreview && (
                 <PreviewSection
                   workbook={convertedData}
                   title="Material Import Preview"
                   onClose={() => setShowInlinePreview(false)}
-                  onDataChange={(modifiedWorkbook) => setConvertedData(modifiedWorkbook)}
+                  onDataChange={(wb) => setConvertedData(wb)}
                 >
                   <AIModificationPanel
                     workbook={convertedData}
                     originalWorkbook={originalConvertedData}
-                    onModify={(modifiedWorkbook) => setConvertedData(modifiedWorkbook)}
+                    onModify={(wb) => setConvertedData(wb)}
                     onRevert={() => setConvertedData(originalConvertedData)}
                   />
                 </PreviewSection>
               )}
             </TabsContent>
-            
-            <TabsContent value="mix-material" className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+
+            {/* ── MIXES TAB ─────────────────────────────────────────────── */}
+            <TabsContent
+              value="mixes"
+              className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500"
+            >
               <Card className="border-border shadow-sm overflow-hidden">
-                <CardContent className="pt-20 pb-20 text-center">
-                  <div className="max-w-md mx-auto space-y-4">
-                    <div className="w-20 h-20 rounded-full bg-primary/10 flex items-center justify-center text-primary mx-auto mb-6">
-                      <FileSpreadsheet className="h-10 w-10" />
+                <CardHeader className="bg-secondary/1 border-b border-border pb-4">
+                  <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+                    <div className="flex-1">
+                      <CardTitle className="text-xl text-secondary mb-1">
+                        Mix Conversion
+                      </CardTitle>
+                      <CardDescription>
+                        Upload one or more mix files. Optionally include a materials lookup file
+                        (name it with "material" in the filename) as the last file to resolve
+                        constituent item codes.
+                      </CardDescription>
                     </div>
-                    <h3 className="text-2xl font-bold text-dark">Mix & Material Upload</h3>
-                    <p className="text-lg text-muted-foreground">
-                      Coming Soon
-                    </p>
-                    <p className="text-sm text-muted-foreground">
-                      This feature will allow you to upload both mix and material data simultaneously for streamlined processing.
-                    </p>
+                    <div className="flex gap-2">
+                      <input
+                        type="file"
+                        id="file-upload-mixes"
+                        className="hidden"
+                        accept=".xlsx,.xls,.csv"
+                        multiple
+                        onChange={(e) => {
+                          if (e.target.files && e.target.files.length > 0) {
+                            onDrop(Array.from(e.target.files));
+                          }
+                        }}
+                      />
+                      <Button
+                        variant="outline"
+                        className="border-primary text-primary hover:bg-primary/5 hover:text-primary-hover"
+                        onClick={() =>
+                          document.getElementById("file-upload-mixes")?.click()
+                        }
+                      >
+                        <Upload className="mr-2 h-4 w-4" />
+                        Select Files
+                      </Button>
+                    </div>
                   </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4 pt-4 border-t border-border">
+                    <div className="space-y-1.5">
+                      <label className="text-sm font-medium text-dark">Customer Name</label>
+                      <Input
+                        type="text"
+                        placeholder="Enter customer name (optional)"
+                        value={customerName}
+                        onChange={(e) => setCustomerName(e.target.value.slice(0, 16))}
+                        maxLength={16}
+                        className="w-full h-10 text-base"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Max 16 characters. Will be added to output filename.
+                      </p>
+                    </div>
+                  </div>
+                </CardHeader>
+
+                <CardContent className="pt-4 space-y-2">
+                  <div
+                    {...getRootProps()}
+                    className={cn(
+                      "border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all duration-200 flex flex-col items-center justify-center gap-3 min-h-[180px]",
+                      isDragActive
+                        ? "border-primary bg-primary/5 scale-[0.99]"
+                        : "border-border hover:border-primary/50 hover:bg-secondary/5",
+                      files.length > 0 ? "bg-secondary/5 border-secondary/30" : ""
+                    )}
+                  >
+                    <input {...getInputProps()} />
+                    {files.length > 0 ? fileListJSX : emptyDropzoneJSX}
+                  </div>
+
+                  {statusBannerJSX}
+                  {validationPanelJSX}
+
+                  {/* AI-assisted conversion flow for mixes */}
+                  {success ? (
+                    <div className="flex items-center justify-end gap-3 mt-4">
+                      <Button
+                        size="lg"
+                        variant="outline"
+                        className="border-primary text-primary hover:bg-primary/5 shadow-md hover:shadow-lg transition-all"
+                        onClick={() => setShowInlinePreview(!showInlinePreview)}
+                      >
+                        <Eye className="mr-2 h-5 w-5" />
+                        {showInlinePreview ? "Hide Preview" : "Preview"}
+                      </Button>
+                      <Button
+                        size="lg"
+                        variant="outline"
+                        className="border-success text-success hover:bg-success/5 shadow-md hover:shadow-lg transition-all"
+                        onClick={handleDownload}
+                      >
+                        <Download className="mr-2 h-5 w-5" />
+                        Download
+                      </Button>
+                      <Button
+                        size="lg"
+                        className="bg-success hover:bg-success2 text-white shadow-md hover:shadow-lg transition-all"
+                        onClick={handleApprove}
+                      >
+                        <CheckCircle2 className="mr-2 h-5 w-5" />
+                        Approve & Queue for Upload
+                      </Button>
+                    </div>
+                  ) : (
+                    <AIMixConversionPanel
+                      files={files}
+                      fileToArray={fileToArray}
+                      onConversionComplete={(wb, issues, stats) => {
+                        setConvertedData(wb);
+                        setOriginalConvertedData(wb);
+                        setValidationIssues(issues);
+                        setConversionStats(stats);
+                        setSuccess(true);
+                      }}
+                      onError={setError}
+                    />
+                  )}
                 </CardContent>
               </Card>
+
+              {success && showInlinePreview && (
+                <PreviewSection
+                  workbook={convertedData}
+                  title="Mix Import Preview"
+                  onClose={() => setShowInlinePreview(false)}
+                  onDataChange={(wb) => setConvertedData(wb)}
+                >
+                  <AIModificationPanel
+                    workbook={convertedData}
+                    originalWorkbook={originalConvertedData}
+                    onModify={(wb) => setConvertedData(wb)}
+                    onRevert={() => setConvertedData(originalConvertedData)}
+                  />
+                </PreviewSection>
+              )}
+            </TabsContent>
+
+            {/* ── MIX & MATERIAL UPLOAD TAB ─────────────────────────────── */}
+            <TabsContent
+              value="mix-material"
+              className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500"
+            >
+              {/* Materials queue */}
+              <Card className="border-border shadow-sm overflow-hidden">
+                <CardHeader className="bg-secondary/1 border-b border-border pb-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <CardTitle className="text-xl text-secondary mb-1">Approved Materials</CardTitle>
+                      <CardDescription>
+                        Material file approved and ready for database upload.
+                      </CardDescription>
+                    </div>
+                    {approvedMaterials && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="text-destructive border-destructive/30 hover:bg-destructive/5"
+                        onClick={() => setApprovedMaterials(null)}
+                      >
+                        <X className="h-4 w-4 mr-1" /> Clear
+                      </Button>
+                    )}
+                  </div>
+                </CardHeader>
+                <CardContent className="pt-4">
+                  {approvedMaterials ? (
+                    <div className="flex items-center justify-between bg-success/5 border border-success/20 rounded-lg p-4">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-full bg-success/10 flex items-center justify-center text-success">
+                          <CheckCircle2 className="h-5 w-5" />
+                        </div>
+                        <div>
+                          <p className="font-semibold text-dark">{approvedMaterials.customerName}</p>
+                          <p className="text-sm text-muted-foreground">
+                            {approvedMaterials.rowCount} material{approvedMaterials.rowCount !== 1 ? "s" : ""} · Approved {approvedMaterials.approvedAt}
+                          </p>
+                        </div>
+                      </div>
+                      <Button
+                        variant="outline"
+                        className="border-primary text-primary hover:bg-primary/5"
+                        onClick={() => handleDownloadApproved(approvedMaterials, "Material")}
+                      >
+                        <Download className="mr-2 h-4 w-4" />
+                        Download for Upload
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="text-center py-8 text-muted-foreground">
+                      <FileSpreadsheet className="h-8 w-8 mx-auto mb-2 opacity-40" />
+                      <p className="text-sm">No approved materials yet. Convert and approve a material file first.</p>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              {/* Mixes queue */}
+              <Card className="border-border shadow-sm overflow-hidden">
+                <CardHeader className="bg-secondary/1 border-b border-border pb-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <CardTitle className="text-xl text-secondary mb-1">Approved Mixes</CardTitle>
+                      <CardDescription>
+                        Mix file approved and ready for database upload.
+                      </CardDescription>
+                    </div>
+                    {approvedMixes && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="text-destructive border-destructive/30 hover:bg-destructive/5"
+                        onClick={() => setApprovedMixes(null)}
+                      >
+                        <X className="h-4 w-4 mr-1" /> Clear
+                      </Button>
+                    )}
+                  </div>
+                </CardHeader>
+                <CardContent className="pt-4">
+                  {approvedMixes ? (
+                    <div className="flex items-center justify-between bg-success/5 border border-success/20 rounded-lg p-4">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-full bg-success/10 flex items-center justify-center text-success">
+                          <CheckCircle2 className="h-5 w-5" />
+                        </div>
+                        <div>
+                          <p className="font-semibold text-dark">{approvedMixes.customerName}</p>
+                          <p className="text-sm text-muted-foreground">
+                            {approvedMixes.rowCount} row{approvedMixes.rowCount !== 1 ? "s" : ""} · Approved {approvedMixes.approvedAt}
+                          </p>
+                        </div>
+                      </div>
+                      <Button
+                        variant="outline"
+                        className="border-primary text-primary hover:bg-primary/5"
+                        onClick={() => handleDownloadApproved(approvedMixes, "Mix")}
+                      >
+                        <Download className="mr-2 h-4 w-4" />
+                        Download for Upload
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="text-center py-8 text-muted-foreground">
+                      <FileSpreadsheet className="h-8 w-8 mx-auto mb-2 opacity-40" />
+                      <p className="text-sm">No approved mixes yet. Convert and approve a mix file first.</p>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              {(approvedMaterials || approvedMixes) && (
+                <div className="bg-primary/5 border border-primary/20 rounded-lg p-4 text-sm text-dark">
+                  <p className="font-medium mb-1">Ready for Upload</p>
+                  <p className="text-muted-foreground">
+                    Download the approved files above and import them into the Quadrel database using the standard import process. Direct database upload is coming soon.
+                  </p>
+                </div>
+              )}
             </TabsContent>
           </Tabs>
         </div>

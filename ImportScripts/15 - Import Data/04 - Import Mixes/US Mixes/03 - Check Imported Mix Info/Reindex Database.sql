@@ -1,0 +1,1 @@
+Exec dbo.Utility_RebuildIndexesUpdateStatisticsResetRecompileFlags

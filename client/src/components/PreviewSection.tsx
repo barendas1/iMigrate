@@ -1,7 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { ChevronLeft, ChevronRight, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import * as XLSX from "xlsx";
@@ -14,27 +13,66 @@ interface PreviewSectionProps {
   children?: React.ReactNode;
 }
 
-export function PreviewSection({ workbook, title, onClose, onDataChange, children }: PreviewSectionProps) {
-  const [currentPage, setCurrentPage] = useState(1);
-  const [columnWidths, setColumnWidths] = useState<{ [key: number]: number }>({});
-  const [editingCell, setEditingCell] = useState<{ row: number; col: number } | null>(null);
-  const [editValue, setEditValue] = useState("");
-  const [data, setData] = useState<any[][]>(() => {
-    if (!workbook) return [];
-    const sheetName = workbook.SheetNames[0];
-    const worksheet = workbook.Sheets[sheetName];
-    return XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+// ── Auto-width computation ────────────────────────────────────────────────────
+
+const CHAR_PX = 7.5;
+const COL_PADDING = 24;
+const MIN_COL_WIDTH = 48;
+const MAX_COL_WIDTH = 300;
+const SAMPLE_ROWS = 150;
+
+/**
+ * Estimate column widths from header text and actual cell content.
+ * Headers are displayed with words on separate lines, so we use longest word length.
+ * Empty columns get just enough space for their header.
+ */
+function computeAutoWidths(headers: any[], rows: any[][]): Record<number, number> {
+  const widths: Record<number, number> = {};
+  const sample = Math.min(rows.length, SAMPLE_ROWS);
+
+  headers.forEach((header, i) => {
+    // Header: displayed word-wrapped, so width = longest word in header
+    const words = String(header || `Col ${i + 1}`).split(/\s+/);
+    const headerLen = Math.max(...words.map((w) => w.length));
+
+    // Content: max string length in sampled rows (skip empty values)
+    let contentLen = 0;
+    for (let r = 0; r < sample; r++) {
+      const v = rows[r]?.[i];
+      if (v != null && v !== "") {
+        contentLen = Math.max(contentLen, String(v).length);
+      }
+    }
+
+    const len = Math.max(headerLen, contentLen);
+    widths[i] = Math.min(MAX_COL_WIDTH, Math.max(MIN_COL_WIDTH, Math.round(len * CHAR_PX + COL_PADDING)));
   });
 
-  const rowsPerPage = 100;
+  return widths;
+}
 
+// ── Component ─────────────────────────────────────────────────────────────────
+
+export function PreviewSection({ workbook, title, onClose, onDataChange, children }: PreviewSectionProps) {
+  const [currentPage, setCurrentPage] = useState(1);
+  const [columnWidths, setColumnWidths] = useState<Record<number, number>>({});
+  const [editingCell, setEditingCell] = useState<{ row: number; col: number } | null>(null);
+  const [editValue, setEditValue] = useState("");
+
+  const [data, setData] = useState<any[][]>(() => {
+    if (!workbook) return [];
+    const ws = workbook.Sheets[workbook.SheetNames[0]];
+    return XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
+  });
+
+  // Sync data + recompute widths when workbook changes
   useEffect(() => {
-    if (workbook) {
-      const sheetName = workbook.SheetNames[0];
-      const worksheet = workbook.Sheets[sheetName];
-      const newData = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as any[][];
-      setData(newData);
-    }
+    if (!workbook) return;
+    const ws = workbook.Sheets[workbook.SheetNames[0]];
+    const newData = XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
+    setData(newData);
+    setColumnWidths(computeAutoWidths(newData[0] || [], newData.slice(1)));
+    setCurrentPage(1);
   }, [workbook]);
 
   if (!workbook) return null;
@@ -42,193 +80,169 @@ export function PreviewSection({ workbook, title, onClose, onDataChange, childre
   const headers = data[0] || [];
   const allRows = data.slice(1);
   const totalRows = allRows.length;
-  const totalPages = Math.ceil(totalRows / rowsPerPage);
 
+  const rowsPerPage = 100;
+  const totalPages = Math.max(1, Math.ceil(totalRows / rowsPerPage));
   const startIndex = (currentPage - 1) * rowsPerPage;
-  const endIndex = startIndex + rowsPerPage;
-  const rows = allRows.slice(startIndex, endIndex);
+  const rows = allRows.slice(startIndex, startIndex + rowsPerPage);
+
+  // ── Column resize ──────────────────────────────────────────────────────────
 
   const handleMouseDown = (colIndex: number, e: React.MouseEvent) => {
     e.preventDefault();
     const startX = e.pageX;
-    const startWidth = columnWidths[colIndex] || 150;
+    const startWidth = columnWidths[colIndex] ?? MIN_COL_WIDTH;
 
-    const handleMouseMove = (moveEvent: MouseEvent) => {
-      const diff = moveEvent.pageX - startX;
-      const newWidth = Math.max(80, startWidth + diff);
-      setColumnWidths(prev => ({ ...prev, [colIndex]: newWidth }));
+    const onMove = (ev: MouseEvent) => {
+      const newWidth = Math.max(36, startWidth + ev.pageX - startX);
+      setColumnWidths((prev) => ({ ...prev, [colIndex]: newWidth }));
     };
-
-    const handleMouseUp = () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
     };
-
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
   };
+
+  // ── Cell editing ───────────────────────────────────────────────────────────
 
   const handleCellClick = (rowIndex: number, colIndex: number) => {
-    const actualRowIndex = startIndex + rowIndex;
-    setEditingCell({ row: actualRowIndex, col: colIndex });
-    setEditValue(String(allRows[actualRowIndex][colIndex] || ""));
+    const actualRow = startIndex + rowIndex;
+    setEditingCell({ row: actualRow, col: colIndex });
+    setEditValue(String(allRows[actualRow]?.[colIndex] ?? ""));
   };
 
-  const handleCellBlur = () => {
-    if (editingCell) {
-      const newData = [...data];
-      const actualRowIndex = editingCell.row + 1; // +1 because data includes headers
-      if (!newData[actualRowIndex]) {
-        newData[actualRowIndex] = [];
-      }
-      newData[actualRowIndex][editingCell.col] = editValue;
-      setData(newData);
+  const commitEdit = () => {
+    if (!editingCell) return;
+    const newData = data.map((r) => [...r]);
+    const targetRow = editingCell.row + 1; // +1 for header
+    if (!newData[targetRow]) newData[targetRow] = [];
+    newData[targetRow][editingCell.col] = editValue;
+    setData(newData);
 
+    if (onDataChange) {
       const sheetName = workbook.SheetNames[0];
-      const newWorksheet = XLSX.utils.aoa_to_sheet(newData);
-      const newWorkbook = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(newWorkbook, newWorksheet, sheetName);
-
-      if (onDataChange) {
-        onDataChange(newWorkbook);
-      }
-
-      setEditingCell(null);
-      setEditValue("");
+      const newWs = XLSX.utils.aoa_to_sheet(newData);
+      const newWb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(newWb, newWs, sheetName);
+      onDataChange(newWb);
     }
+    setEditingCell(null);
+    setEditValue("");
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") {
-      handleCellBlur();
-    } else if (e.key === "Escape") {
-      setEditingCell(null);
-      setEditValue("");
-    }
+    if (e.key === "Enter") commitEdit();
+    else if (e.key === "Escape") { setEditingCell(null); setEditValue(""); }
   };
+
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <Card className="border-border shadow-sm overflow-hidden animate-in fade-in slide-in-from-bottom-4 duration-500">
-      <CardHeader className="bg-secondary/1 border-b border-border pb-6 flex flex-row items-center justify-between">
+      <CardHeader className="bg-secondary/1 border-b border-border pb-4 flex flex-row items-center justify-between">
         <div>
           <CardTitle className="text-xl text-secondary">{title}</CardTitle>
           <CardDescription>
-            Showing {startIndex + 1}-{Math.min(endIndex, totalRows)} of {totalRows} rows • Click any cell to edit
+            Showing {startIndex + 1}–{Math.min(startIndex + rowsPerPage, totalRows)} of {totalRows} rows · Click any cell to edit
           </CardDescription>
         </div>
-        <Button 
-          variant="ghost" 
-          size="sm"
-          onClick={onClose}
-          className="text-muted-foreground hover:text-destructive"
-        >
+        <Button variant="ghost" size="sm" onClick={onClose} className="text-muted-foreground hover:text-destructive">
           <X className="h-4 w-4" />
         </Button>
       </CardHeader>
 
       <CardContent className="pt-4 space-y-3">
-        {children && (
-          <div className="mb-4">
-            {children}
-          </div>
-        )}
+        {children && <div className="mb-4">{children}</div>}
 
-        {/* Scrollable Table */}
-        {/* Make this the explicit scrolling boundary (relative + overflow-y-auto) */}
-        <div className="h-[500px] w-full rounded-lg border relative overflow-y-auto">
-          {/* Table is placed directly inside the scrolling container */}
-          {/* Use table-fixed so column widths behave predictably with sticky THs */}
-          <Table className="min-w-full table-fixed" style={{ tableLayout: 'fixed' }}>
-            {/* Keep the header wrapper for semantics but put sticky on each TH */}
-            <TableHeader>
-              <TableRow>
-                {headers.map((header: any, index: number) => (
-                  <TableHead
-                    key={index}
-                    // sticky placed on each header cell (th)
-                    className="sticky top-0 z-20 bg-card font-semibold text-dark relative group border-r border-border last:border-r-0"
-                    style={{
-                      width: columnWidths[index] || 150,
-                      minWidth: columnWidths[index] || 150,
-                      maxWidth: columnWidths[index] || 150,
-                      // ensure th stays above and paints its background
-                      // (these inline styles help with some browser repaint issues)
-                      boxSizing: 'border-box',
-                    }}
-                  >
-                    <div className="flex flex-col items-center justify-center text-center whitespace-pre-wrap break-words leading-tight py-2">
-                      {(header || `Column ${index + 1}`).toString().split(" ").join("\n")}
-                    </div>
-                    <div
-                      className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/50 group-hover:bg-primary/30"
-                      onMouseDown={(e) => handleMouseDown(index, e)}
-                    />
-                  </TableHead>
-                ))}
-              </TableRow>
-            </TableHeader>
+        {/* Table — single container that scrolls both axes */}
+        <div
+          className="h-[500px] rounded-lg border overflow-auto relative"
+          style={{ WebkitOverflowScrolling: "touch" }}
+        >
+          <table
+            className="border-collapse"
+            style={{ tableLayout: "fixed", minWidth: "max-content" }}
+          >
+            <thead>
+              <tr>
+                {headers.map((header: any, i: number) => {
+                  const w = columnWidths[i] ?? MIN_COL_WIDTH;
+                  return (
+                    <th
+                      key={i}
+                      className="sticky top-0 z-20 bg-card font-semibold text-dark text-xs border-r border-b border-border last:border-r-0 relative group select-none"
+                      style={{ width: w, minWidth: w, maxWidth: w, boxSizing: "border-box" }}
+                    >
+                      <div className="px-2 py-2 text-center whitespace-normal break-words leading-tight">
+                        {String(header || `Col ${i + 1}`)}
+                      </div>
+                      {/* Resize handle */}
+                      <div
+                        className="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/60 group-hover:bg-primary/20 z-10"
+                        onMouseDown={(e) => handleMouseDown(i, e)}
+                      />
+                    </th>
+                  );
+                })}
+              </tr>
+            </thead>
 
-            <TableBody>
+            <tbody>
               {rows.map((row: any[], rowIndex: number) => (
-                <TableRow key={rowIndex} className="hover:bg-secondary/5">
+                <tr key={rowIndex} className="hover:bg-secondary/5 border-b border-border last:border-b-0">
                   {headers.map((_: any, colIndex: number) => {
-                    const actualRowIndex = startIndex + rowIndex;
-                    const isEditing = editingCell?.row === actualRowIndex && editingCell?.col === colIndex;
+                    const actualRow = startIndex + rowIndex;
+                    const isEditing = editingCell?.row === actualRow && editingCell?.col === colIndex;
+                    const w = columnWidths[colIndex] ?? MIN_COL_WIDTH;
+                    const cellValue = row[colIndex] != null && row[colIndex] !== ""
+                      ? String(row[colIndex])
+                      : "";
 
                     return (
-                      <TableCell
+                      <td
                         key={colIndex}
-                        className="whitespace-nowrap p-0 border-r border-border last:border-r-0"
-                        style={{
-                          width: columnWidths[colIndex] || 150,
-                          minWidth: columnWidths[colIndex] || 150,
-                          maxWidth: columnWidths[colIndex] || 150,
-                          boxSizing: 'border-box',
-                        }}
+                        className="border-r border-border last:border-r-0 p-0 text-xs"
+                        style={{ width: w, minWidth: w, maxWidth: w, boxSizing: "border-box" }}
                       >
                         {isEditing ? (
                           <Input
                             value={editValue}
                             onChange={(e) => setEditValue(e.target.value)}
-                            onBlur={handleCellBlur}
+                            onBlur={commitEdit}
                             onKeyDown={handleKeyDown}
                             autoFocus
-                            className="h-full border-0 rounded-none focus-visible:ring-2 focus-visible:ring-primary"
+                            className="h-full border-0 rounded-none focus-visible:ring-2 focus-visible:ring-primary text-xs px-2 py-1"
                           />
                         ) : (
                           <div
-                            className="px-4 py-2 cursor-text hover:bg-primary/5"
+                            className="px-2 py-1.5 cursor-text hover:bg-primary/5 overflow-hidden whitespace-nowrap text-ellipsis"
+                            title={cellValue}
                             onClick={() => handleCellClick(rowIndex, colIndex)}
-                            style={{
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              whiteSpace: "nowrap",
-                            }}
                           >
-                            {row[colIndex] !== undefined && row[colIndex] !== null
-                              ? String(row[colIndex])
-                              : ""}
+                            {cellValue}
                           </div>
                         )}
-                      </TableCell>
+                      </td>
                     );
                   })}
-                </TableRow>
+                </tr>
               ))}
-            </TableBody>
-          </Table>
+            </tbody>
+          </table>
         </div>
 
-        {/* Pagination Controls */}
-        <div className="flex items-center justify-between pt-2">
-          <div className="text-sm text-muted-foreground">
+        {/* Pagination */}
+        <div className="flex items-center justify-between pt-1">
+          <span className="text-sm text-muted-foreground">
             Page {currentPage} of {totalPages}
-          </div>
+          </span>
           <div className="flex gap-2">
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+              onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
               disabled={currentPage === 1}
             >
               <ChevronLeft className="h-4 w-4 mr-1" />
@@ -237,7 +251,7 @@ export function PreviewSection({ workbook, title, onClose, onDataChange, childre
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+              onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
               disabled={currentPage === totalPages}
             >
               Next
@@ -245,7 +259,6 @@ export function PreviewSection({ workbook, title, onClose, onDataChange, childre
             </Button>
           </div>
         </div>
-
       </CardContent>
     </Card>
   );

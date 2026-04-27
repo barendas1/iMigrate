@@ -1,0 +1,975 @@
+import * as XLSX from "xlsx";
+
+// =============================================================================
+// MATERIAL CONVERTER — universal.ts
+//
+// PURPOSE:
+//   Accepts raw Excel exports from any source system (any column names, any
+//   column order, any number of extra columns).  Detects which input column
+//   maps to each required Quadrel field using a broad alias dictionary, then
+//   cleans / corrects / validates the data and writes a single standardised
+//   Quadrel Material Import output file.
+//
+// OUTPUT FORMAT (always fixed — 20 columns in this exact order):
+//   0  Plant Code (Required)
+//   1  Trade Name (Required)
+//   2  Material Date (mm/dd/yyyy)
+//   3  Family Material Type (Required)
+//   4  Material Type (Required)
+//   5  Specific Gravity (Required)
+//   6  Is Liquid Admixture (Yes/No)
+//   7  Water Contribution (%)
+//   8  Cost
+//   9  Cost Units
+//   10 Manufacturer
+//   11 Manufacturer Source
+//   12 Batching Order Number
+//   13 Production Item Code
+//   14 Production Item Description
+//   15 Production Item Short Description
+//   16 Production Item Category
+//   17 Production Item Category Description
+//   18 Production Item Category Short Description
+//   19 Batch Panel Code
+// =============================================================================
+
+// ---------- VALIDATION & TRANSFORMATION RULES ----------
+//
+// ============================================================
+// MATERIAL VALIDATION CHECKS (applied during conversion)
+// ============================================================
+//
+// ROW-LEVEL CHECKS (applied per input row, per file):
+//
+//   1. EMPTY ROW SKIP
+//      - If both Trade Name and Production Item Code resolve to empty,
+//        the row is silently skipped (treated as a blank row).
+//
+//   2. TRADE NAME REQUIRED
+//      - Trade Name must be present and non-empty after trimming.
+//      - If missing, the row is skipped and an ERROR is reported.
+//
+//   3. SPECIFIC GRAVITY REQUIRED & NON-ZERO
+//      - After applying the default-to-1 rule (Transformation T3 below),
+//        Specific Gravity must be numeric and not equal to 0.
+//      - If still missing or zero, the row is skipped and an ERROR is reported.
+//
+// TRANSFORMATION RULES (applied before validation):
+//
+//   T1. DATE FORMAT
+//       - JS Date objects and Excel serial numbers are formatted as
+//         "MM/DD/YYYY" strings.  Existing strings are passed through as-is.
+//
+//   T2. FAMILY TYPE AUTO-CORRECTION (driven by Material Type value)
+//       - "Fly Ash" or "Silica Fume"  → Family Type = "Mineral"
+//       - "Color"                      → Family Type = "Admixture & Fiber"
+//                                        Production Item Category = "Admixture & Fiber"
+//       A warning is emitted whenever a correction is made.
+//
+//   T3. SPECIFIC GRAVITY DEFAULT
+//       - If SG is missing/null AND Family Type (after T2) is
+//         "Admixture & Fiber", SG defaults to 1.
+//
+//   T4. COST UNITS DEFAULT
+//       - If Cost Units is missing/null/empty, defaults to "$/lb".
+//
+//   T5. PRODUCTION ITEM CODE CLEANUP
+//       - All whitespace is stripped so the code is one continuous string
+//         (e.g. "NNQ 20" → "NNQ20").
+//
+// CROSS-FILE / POST-MERGE CHECKS (applied after all files are merged):
+//
+//   4. DUPLICATE TRADE NAME PER PLANT
+//      - No two rows may share the same Trade Name within the same Plant Code.
+//      - Duplicates (after the first) are removed; an ERROR is reported.
+//
+//   5. DUPLICATE PRODUCTION ITEM CODE PER PLANT
+//      - No two rows may share the same Production Item Code within the same
+//        Plant Code (only enforced when the item code is non-empty).
+//      - Duplicates (after the first) are removed; an ERROR is reported.
+//
+// REPORTING:
+//   - All issues surface in the UI ValidationPanel after conversion.
+//   - Issues are tagged "error" (row skipped/removed) or "warning"
+//     (row kept but something was auto-corrected).
+//   - Each message is prefixed with the source filename when multiple files
+//     are uploaded.
+// ============================================================
+
+export interface ValidationIssue {
+  type: "error" | "warning";
+  message: string;
+  row?: number;   // 1-based data row index (relative to header)
+  field?: string; // output column name where the issue was found
+}
+
+export interface MaterialConversionResult {
+  rows: any[][];
+  issues: ValidationIssue[];
+  totalInputRows: number;
+  totalOutputRows: number;
+  skippedRows: number;
+}
+
+// ---------------------------------------------------------------------------
+// Fixed output headers (always written in this order)
+// ---------------------------------------------------------------------------
+const OUTPUT_HEADERS = [
+  "Plant Code (Required)",
+  "Trade Name (Required)",
+  "Material Date (mm/dd/yyyy)",
+  "Family Material Type (Required)",
+  "Material Type (Required)",
+  "Specific Gravity (Required)",
+  "Is Liquid Admixture (Yes/No)",
+  "Water Contribution (%)",
+  "Cost",
+  "Cost Units",
+  "Manufacturer",
+  "Manufacturer Source",
+  "Batching Order Number",
+  "Production Item Code",
+  "Production Item Description",
+  "Production Item Short Description",
+  "Production Item Category",
+  "Production Item Category Description",
+  "Production Item Category Short Description",
+  "Batch Panel Code",
+];
+
+// Enum-style indices into OUTPUT_HEADERS
+const COL = {
+  PLANT:            0,
+  TRADE_NAME:       1,
+  DATE:             2,
+  FAMILY_TYPE:      3,
+  MATERIAL_TYPE:    4,
+  SPECIFIC_GRAVITY: 5,
+  IS_LIQUID:        6,
+  WATER_CONTRIB:    7,
+  COST:             8,
+  COST_UNITS:       9,
+  MANUFACTURER:     10,
+  MFR_SOURCE:       11,
+  BATCH_ORDER:      12,
+  ITEM_CODE:        13,
+  ITEM_DESC:        14,
+  ITEM_SHORT_DESC:  15,
+  ITEM_CATEGORY:    16,
+  ITEM_CAT_DESC:    17,
+  ITEM_CAT_SHORT:   18,
+  BATCH_PANEL:      19,
+} as const;
+
+// ---------------------------------------------------------------------------
+// ALIAS DICTIONARY
+// Maps each output field key to a list of possible input header strings
+// (all lowercased, trimmed — matching is case-insensitive).
+// Add new aliases here as new source formats are encountered.
+// ---------------------------------------------------------------------------
+const ALIASES: Record<keyof typeof COL, string[]> = {
+  PLANT: [
+    "plant code (required)", "plant code", "plant", "plant no", "plant number",
+    "plant id", "plant #", "location", "site", "site code", "site id",
+    "batch plant", "batch plant code", "facility", "facility code",
+    "plantcode", "plantid", "plantno",
+  ],
+  TRADE_NAME: [
+    "trade name (required)", "trade name", "tradename", "material name",
+    "material", "mat name", "product name", "product", "description",
+    "material description", "name", "item name", "item description",
+    "mat description", "material trade name",
+  ],
+  DATE: [
+    "material date (mm/dd/yyyy)", "material date", "date", "effective date",
+    "start date", "mat date", "date added", "created date", "entry date",
+  ],
+  FAMILY_TYPE: [
+    "family material type (required)", "family material type", "family type",
+    "material family", "family", "mat family", "material group",
+    "material category group", "group",
+  ],
+  MATERIAL_TYPE: [
+    "material type (required)", "material type", "mat type", "type",
+    "material class", "class", "category", "mat category",
+    "material sub type", "subtype", "sub type",
+  ],
+  SPECIFIC_GRAVITY: [
+    "specific gravity (required)", "specific gravity", "sg", "sp gr",
+    "sp. gr.", "sp. gravity", "specific gr", "relative density",
+    "density", "bulk density", "specific weight",
+    // Raw dispatch export names
+    "specificgravity", "spgravity", "sp_gravity", "spec_gravity",
+    "relativedensity", "rd",
+  ],
+  IS_LIQUID: [
+    "is liquid admixture (yes/no)", "is liquid admixture", "is liquid",
+    "liquid admixture", "liquid", "admixture type", "liquid flag",
+    "isliquid", "isliquidadmixture", "liquid_flag",
+  ],
+  WATER_CONTRIB: [
+    "water contribution (%)", "water contribution", "water contrib",
+    "water %", "water percent", "water content", "free water",
+    "water contribution percent",
+    // Raw dispatch export names
+    "moisture", "moisture content", "moisture%", "freemoisture",
+    "absorption", "freewater",
+  ],
+  COST: [
+    "cost", "unit cost", "price", "unit price", "material cost",
+    "mat cost", "rate", "cost per unit",
+  ],
+  COST_UNITS: [
+    "cost units", "cost unit", "unit", "units", "price unit",
+    "price units", "uom", "unit of measure", "pricing unit",
+  ],
+  MANUFACTURER: [
+    "manufacturer", "mfr", "vendor", "supplier", "brand",
+    "make", "producer", "manufacturer name",
+  ],
+  MFR_SOURCE: [
+    "manufacturer source", "mfr source", "source", "supplier source",
+    "vendor source", "supply source", "source name", "origin",
+    "manufacturer location", "mfr location",
+  ],
+  BATCH_ORDER: [
+    "batching order number", "batching order", "batch order", "batch order number",
+    "batch sequence", "batching sequence", "order", "order number",
+    "batch number", "batching number",
+  ],
+  ITEM_CODE: [
+    "production item code", "item code", "prod item code", "prod code",
+    "product code", "material code", "mat code", "code", "sku",
+    "item number", "item no", "item #", "material number", "mat number",
+    "material id", "mat id", "part number", "part no",
+    // Raw dispatch export IDs
+    "cementid", "aggregateid", "admixtureid", "extraid", "externalid",
+    "materialid", "mat_id", "prodid", "productid",
+  ],
+  ITEM_DESC: [
+    "production item description", "item description", "prod item description",
+    "item desc", "prod description", "product description", "material description",
+    "mat desc", "full description", "long description",
+  ],
+  ITEM_SHORT_DESC: [
+    "production item short description", "item short description",
+    "short description", "short desc", "item short desc",
+    "prod short description", "abbreviated description", "abbrev desc",
+  ],
+  ITEM_CATEGORY: [
+    "production item category", "item category", "prod item category",
+    "category", "material category", "mat category", "product category",
+    "prod category",
+  ],
+  ITEM_CAT_DESC: [
+    "production item category description", "item category description",
+    "category description", "cat description", "cat desc",
+    "item cat description", "prod category description",
+  ],
+  ITEM_CAT_SHORT: [
+    "production item category short description",
+    "item category short description", "category short description",
+    "cat short description", "cat short desc", "item cat short",
+    "prod category short",
+  ],
+  BATCH_PANEL: [
+    "batch panel code", "batch panel", "panel code", "panel",
+    "batcher code", "batcher", "batch code",
+  ],
+};
+
+// ---------------------------------------------------------------------------
+// Family Type correction map: MaterialType (lowercase) → correct FamilyType
+// ---------------------------------------------------------------------------
+const MATERIAL_TYPE_TO_FAMILY: Record<string, string> = {
+  "fly ash":    "Mineral",
+  "silica fume": "Mineral",
+  "color":      "Admixture & Fiber",
+  "slag":       "Mineral",
+  "water":      "Water",
+};
+
+// ---------------------------------------------------------------------------
+// Valid Family Material Types (maps to MaterialTypeID 1–5 in the database)
+// ---------------------------------------------------------------------------
+const VALID_FAMILY_TYPES = new Set([
+  "cement", "mineral", "aggregate", "admixture & fiber", "water",
+]);
+
+// ---------------------------------------------------------------------------
+// Valid Cost Units accepted by the database
+// ---------------------------------------------------------------------------
+const VALID_COST_UNITS = new Set([
+  "$/lb", "$/liter", "$/gal", "$/ton", "$/kg", "$/metric ton", "$/mton",
+  "$/tn", "$/cy", "$//yd^3", "$/gl", "$/oz",
+  "pounds", "fluid oz", "gallons", "ounces", "m3", "cy", "ga", "gl", "oz",
+  "lb", "ton", "tons", "ml-liter", "ml", "liter", "liters", "litres",
+  "lt", "l", "ll", "kg", "tm", "mt",
+]);
+
+// ---------------------------------------------------------------------------
+// File-type inference: detect what kind of raw export a file is by inspecting
+// its header columns, so we can supply smart defaults when Family Type,
+// Material Type, or Is Liquid columns are absent.
+// Returns one of: "cement" | "aggregate" | "admixture" | "extra" | "unknown"
+// ---------------------------------------------------------------------------
+type FileType = "cement" | "aggregate" | "admixture" | "extra" | "unknown";
+
+function inferFileType(headerRow: any[]): FileType {
+  const joined = headerRow.map((v) => String(v ?? "").trim().toLowerCase()).join("|");
+  if (joined.includes("cementid"))    return "cement";
+  if (joined.includes("aggregateid")) return "aggregate";
+  if (joined.includes("admixtureid")) return "admixture";
+  if (joined.includes("extraid"))     return "extra";
+  return "unknown";
+}
+
+// Default Family Type per file type
+const FILE_TYPE_FAMILY: Partial<Record<FileType, string>> = {
+  cement:    "Cement",
+  aggregate: "Aggregate",
+  admixture: "Admixture & Fiber",
+};
+
+// Default Material Type per file type (used when Material Type column is absent)
+const FILE_TYPE_MATERIAL_TYPE: Partial<Record<FileType, string>> = {
+  cement:    "Cement",
+  aggregate: "Aggregate",
+  admixture: "Admixture & Fiber",
+};
+
+// Default Is Liquid per file type
+const FILE_TYPE_IS_LIQUID: Partial<Record<FileType, string>> = {
+  cement:    "No",
+  aggregate: "No",
+  admixture: "Yes",
+};
+
+// ---------------------------------------------------------------------------
+// Helper: format a date value to MM/DD/YYYY string
+// ---------------------------------------------------------------------------
+function formatDate(value: any): string | null {
+  if (value == null || value === "") return null;
+  if (typeof value === "string") return value.trim();
+  if (value instanceof Date) {
+    const mm   = String(value.getMonth() + 1).padStart(2, "0");
+    const dd   = String(value.getDate()).padStart(2, "0");
+    const yyyy = value.getFullYear();
+    return `${mm}/${dd}/${yyyy}`;
+  }
+  if (typeof value === "number") {
+    try {
+      const d = XLSX.SSF.parse_date_code(value);
+      if (d) {
+        const mm   = String(d.m).padStart(2, "0");
+        const dd   = String(d.d).padStart(2, "0");
+        return `${mm}/${dd}/${d.y}`;
+      }
+    } catch (_) { /* fall through */ }
+  }
+  return String(value);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: find the header row index (scans first 6 rows)
+// ---------------------------------------------------------------------------
+function findHeaderRowIndex(rows: any[][]): number {
+  for (let i = 0; i < Math.min(6, rows.length); i++) {
+    const row = rows[i];
+    if (!row) continue;
+    const joined = row.map((v) => String(v ?? "").toLowerCase()).join("|");
+    if (
+      joined.includes("plant") ||
+      joined.includes("trade name") ||
+      joined.includes("material type") ||
+      joined.includes("material name") ||
+      joined.includes("specific gravity") ||
+      joined.includes("specificgravity") ||
+      joined.includes("cementid") ||
+      joined.includes("aggregateid") ||
+      joined.includes("admixtureid") ||
+      joined.includes("extraid") ||
+      joined.includes("name")
+    ) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build a resolved column index map for a given header row.
+// For each output field key, finds the first matching input column index.
+// ---------------------------------------------------------------------------
+function resolveColumns(headerRow: any[]): Map<keyof typeof COL, number> {
+  // Build a normalised lookup of input headers: normalised -> col index
+  const inputMap = new Map<string, number>();
+  headerRow.forEach((cell, idx) => {
+    const norm = String(cell ?? "").trim().toLowerCase();
+    if (norm && !inputMap.has(norm)) {
+      inputMap.set(norm, idx);
+    }
+  });
+
+  const resolved = new Map<keyof typeof COL, number>();
+
+  for (const fieldKey of Object.keys(ALIASES) as Array<keyof typeof COL>) {
+    for (const alias of ALIASES[fieldKey]) {
+      if (inputMap.has(alias)) {
+        resolved.set(fieldKey, inputMap.get(alias)!);
+        break;
+      }
+    }
+    // If no exact alias matched, try partial / contains matching as fallback
+    if (!resolved.has(fieldKey)) {
+      // Use the first alias as the "canonical" keyword to search for
+      const keyword = ALIASES[fieldKey][0].toLowerCase();
+      for (const [norm, idx] of Array.from(inputMap.entries())) {
+        if (norm.includes(keyword) || keyword.includes(norm)) {
+          resolved.set(fieldKey, idx);
+          break;
+        }
+      }
+    }
+  }
+
+  return resolved;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: safely read a value from a raw row via the resolved column map
+// ---------------------------------------------------------------------------
+function pick(row: any[], map: Map<keyof typeof COL, number>, key: keyof typeof COL): any {
+  const idx = map.get(key);
+  if (idx === undefined) return null;
+  const v = row[idx];
+  return v === undefined ? null : v;
+}
+
+// ---------------------------------------------------------------------------
+// REVALIDATION — runs validation checks against already-converted workbook
+// data (e.g. after AI modification).  Takes the rows from the current
+// workbook sheet (including the header row) and returns a fresh set of
+// ValidationIssue items without modifying the data.
+// ---------------------------------------------------------------------------
+export interface RevalidationResult {
+  issues: ValidationIssue[];
+  totalRows: number;     // data rows checked (excluding header)
+  errorRows: number;     // rows with at least one error
+}
+
+export function revalidateMaterialWorkbook(rows: any[][]): RevalidationResult {
+  const issues: ValidationIssue[] = [];
+  let errorRows = 0;
+
+  // rows[0] is the header row — data starts at rows[1]
+  const dataRows = rows.slice(1);
+
+  // Per-row checks
+  dataRows.forEach((row, idx) => {
+    const dataRowNum = idx + 1; // 1-based
+    const tradeName  = String(row[COL.TRADE_NAME]  ?? "").trim();
+    const itemCode   = String(row[COL.ITEM_CODE]   ?? "").trim();
+
+    // Skip fully blank rows silently
+    if (!tradeName && !itemCode) return;
+
+    let rowHasError = false;
+
+    // CHECK: Trade Name required
+    if (!tradeName) {
+      issues.push({
+        type: "error",
+        message: `Row ${dataRowNum}: Missing Trade Name.`,
+        row: dataRowNum,
+        field: "Trade Name (Required)",
+      });
+      rowHasError = true;
+    }
+
+    // CHECK: Plant Code blank
+    const plantCode = String(row[COL.PLANT] ?? "").trim();
+    if (!plantCode) {
+      issues.push({
+        type: "warning",
+        message: `Row ${dataRowNum}${tradeName ? ` ('${tradeName}')` : ""}: Plant Code is blank.`,
+        row: dataRowNum,
+        field: "Plant Code (Required)",
+      });
+    }
+
+    // CHECK: Family Material Type blank or invalid
+    const familyType = String(row[COL.FAMILY_TYPE] ?? "").trim();
+    if (!familyType) {
+      issues.push({
+        type: "warning",
+        message: `Row ${dataRowNum}${tradeName ? ` ('${tradeName}')` : ""}: Family Material Type is blank.`,
+        row: dataRowNum,
+        field: "Family Material Type (Required)",
+      });
+    } else if (!VALID_FAMILY_TYPES.has(familyType.toLowerCase())) {
+      issues.push({
+        type: "warning",
+        message: `Row ${dataRowNum}${tradeName ? ` ('${tradeName}')` : ""}: Family Material Type '${familyType}' is not recognized. Valid values: Cement, Mineral, Aggregate, Admixture & Fiber, Water.`,
+        row: dataRowNum,
+        field: "Family Material Type (Required)",
+      });
+    }
+
+    // CHECK: Material Type blank
+    const materialType = String(row[COL.MATERIAL_TYPE] ?? "").trim();
+    if (!materialType) {
+      issues.push({
+        type: "warning",
+        message: `Row ${dataRowNum}${tradeName ? ` ('${tradeName}')` : ""}: Material Type is blank.`,
+        row: dataRowNum,
+        field: "Material Type (Required)",
+      });
+    }
+
+    // CHECK: Specific Gravity in range 0.4–10.0
+    const sgVal = row[COL.SPECIFIC_GRAVITY];
+    const sgNum = (sgVal === null || sgVal === undefined || sgVal === "") ? null : Number(sgVal);
+    if (sgNum === null || isNaN(sgNum) || sgNum < 0.4 || sgNum >= 10.0) {
+      issues.push({
+        type: "error",
+        message: `Row ${dataRowNum}${tradeName ? ` ('${tradeName}')` : ""}: Specific Gravity must be 0.4 or greater and less than 10.0 (got ${sgNum ?? "missing"}).`,
+        row: dataRowNum,
+        field: "Specific Gravity (Required)",
+      });
+      rowHasError = true;
+    }
+
+    // CHECK: Trade Name length <= 70
+    if (tradeName.length > 70) {
+      issues.push({
+        type: "warning",
+        message: `Row ${dataRowNum} ('${tradeName}'): Trade Name exceeds 70 characters (${tradeName.length}).`,
+        row: dataRowNum,
+        field: "Trade Name (Required)",
+      });
+    }
+
+    // CHECK: Cost >= 0
+    const costVal = row[COL.COST];
+    const costNum = (costVal === null || costVal === undefined || costVal === "") ? null : Number(costVal);
+    if (costNum !== null && !isNaN(costNum) && costNum < 0) {
+      issues.push({
+        type: "error",
+        message: `Row ${dataRowNum}${tradeName ? ` ('${tradeName}')` : ""}: Cost must be 0.0 or greater.`,
+        row: dataRowNum,
+        field: "Cost",
+      });
+      rowHasError = true;
+    }
+
+    // CHECK: Cost Units valid when cost is provided
+    const costUnits = String(row[COL.COST_UNITS] ?? "").trim();
+    if (costNum !== null && !isNaN(costNum) && costNum >= 0 &&
+        costUnits && !VALID_COST_UNITS.has(costUnits.toLowerCase())) {
+      issues.push({
+        type: "warning",
+        message: `Row ${dataRowNum}${tradeName ? ` ('${tradeName}')` : ""}: Cost Unit '${costUnits}' is not in the recognized list.`,
+        row: dataRowNum,
+        field: "Cost Units",
+      });
+    }
+
+    // CHECK: Batching Order Number must be numeric
+    const batchOrderVal = String(row[COL.BATCH_ORDER] ?? "").trim();
+    if (batchOrderVal && isNaN(Number(batchOrderVal))) {
+      issues.push({
+        type: "error",
+        message: `Row ${dataRowNum}${tradeName ? ` ('${tradeName}')` : ""}: Batching Order Number '${batchOrderVal}' must be numeric.`,
+        row: dataRowNum,
+        field: "Batching Order Number",
+      });
+      rowHasError = true;
+    }
+
+    // CHECK: Manufacturer Source <= 50 chars
+    const mfrSource = String(row[COL.MFR_SOURCE] ?? "").trim();
+    if (mfrSource.length > 50) {
+      issues.push({
+        type: "warning",
+        message: `Row ${dataRowNum}${tradeName ? ` ('${tradeName}')` : ""}: Manufacturer Source Name exceeds 50 characters (${mfrSource.length}).`,
+        row: dataRowNum,
+        field: "Manufacturer Source",
+      });
+    }
+
+    if (rowHasError) errorRows++;
+  });
+
+  // CHECK 4: Duplicate Trade Name per Plant
+  const tradeNameSeen = new Map<string, number>();
+  dataRows.forEach((row, idx) => {
+    const tradeName = String(row[COL.TRADE_NAME] ?? "").trim();
+    const itemCode  = String(row[COL.ITEM_CODE]  ?? "").trim();
+    if (!tradeName && !itemCode) return;
+    const key = `${String(row[COL.PLANT] ?? "").trim().toUpperCase()}||${tradeName.toUpperCase()}`;
+    if (tradeNameSeen.has(key)) {
+      const plant = String(row[COL.PLANT] ?? "").trim();
+      issues.push({
+        type: "error",
+        message: `Row ${idx + 1}: Duplicate Trade Name in Plant ${plant || "(unknown)"} — '${tradeName}' already exists.`,
+        row: idx + 1,
+        field: "Trade Name",
+      });
+    } else {
+      tradeNameSeen.set(key, idx);
+    }
+  });
+
+  // CHECK 5: Duplicate Production Item Code per Plant
+  const itemCodeSeen = new Map<string, number>();
+  dataRows.forEach((row, idx) => {
+    const code = String(row[COL.ITEM_CODE] ?? "").trim();
+    if (!code) return;
+    const key = `${String(row[COL.PLANT] ?? "").trim().toUpperCase()}||${code.toUpperCase()}`;
+    if (itemCodeSeen.has(key)) {
+      const plant = String(row[COL.PLANT] ?? "").trim();
+      issues.push({
+        type: "error",
+        message: `Row ${idx + 1}: Duplicate Item Code '${code}' in Plant ${plant || "(unknown)"}.`,
+        row: idx + 1,
+        field: "Production Item Code",
+      });
+    } else {
+      itemCodeSeen.set(key, idx);
+    }
+  });
+
+  return {
+    issues,
+    totalRows: dataRows.filter((r) => {
+      const t = String(r[COL.TRADE_NAME] ?? "").trim();
+      const c = String(r[COL.ITEM_CODE]  ?? "").trim();
+      return t || c;
+    }).length,
+    errorRows,
+  };
+}
+
+export function convertAndMergeMaterials(
+  files: { data: any[][]; fileName: string }[]
+): MaterialConversionResult {
+  const allIssues: ValidationIssue[] = [];
+  const allDataRows: any[][] = [];
+  let totalInputRows = 0;
+  let totalSkipped   = 0;
+
+  const multiFile = files.length > 1;
+
+  for (const { data, fileName } of files) {
+    const prefix = multiFile ? `[${fileName}] ` : "";
+
+    if (!data || data.length === 0) {
+      allIssues.push({ type: "error", message: `${prefix}File is empty or could not be read.` });
+      continue;
+    }
+
+    const headerIdx = findHeaderRowIndex(data);
+    const headerRow = data[headerIdx];
+    const colMap    = resolveColumns(headerRow);
+
+    // Detect file type from column structure
+    const fileType = inferFileType(headerRow);
+
+    // Skip extra-list files entirely — they contain charges/fees, not materials
+    if (fileType === "extra") {
+      allIssues.push({
+        type: "warning",
+        message: `${prefix}File appears to be an extras/charges list (contains 'ExtraId' column) — skipped. Only material files are processed.`,
+      });
+      continue;
+    }
+
+    // Warn about any output fields that could not be mapped (only critical ones)
+    const unmapped: string[] = [];
+    if (!colMap.has("TRADE_NAME")) unmapped.push(OUTPUT_HEADERS[COL.TRADE_NAME]);
+    if (!colMap.has("SPECIFIC_GRAVITY")) unmapped.push(OUTPUT_HEADERS[COL.SPECIFIC_GRAVITY]);
+    if (unmapped.length > 0) {
+      allIssues.push({
+        type: "warning",
+        message: `${prefix}Could not find columns for: ${unmapped.join(", ")}. Those fields will be empty in the output.`,
+      });
+    }
+
+    // Process data rows
+    for (let ri = headerIdx + 1; ri < data.length; ri++) {
+      const raw = data[ri];
+      if (!raw) continue;
+
+      const dataRowNum = ri - headerIdx; // 1-based relative to header
+
+      const tradeName  = String(pick(raw, colMap, "TRADE_NAME")  ?? "").trim();
+      const itemCode   = String(pick(raw, colMap, "ITEM_CODE")    ?? "").trim();
+
+      // CHECK 1: Skip fully blank rows silently
+      if (!tradeName && !itemCode) continue;
+
+      totalInputRows++;
+
+      // CHECK 2: Trade Name required
+      if (!tradeName) {
+        allIssues.push({
+          type: "error",
+          message: `${prefix}Row ${dataRowNum}: Missing Trade Name — row skipped.`,
+          row: dataRowNum,
+          field: "Trade Name",
+        });
+        totalSkipped++;
+        continue;
+      }
+
+      // Read remaining fields
+      let familyType   = String(pick(raw, colMap, "FAMILY_TYPE")  ?? "").trim();
+      let materialType = String(pick(raw, colMap, "MATERIAL_TYPE") ?? "").trim();
+      let sg           = pick(raw, colMap, "SPECIFIC_GRAVITY");
+      let isLiquid     = String(pick(raw, colMap, "IS_LIQUID")     ?? "").trim();
+
+      // Apply file-type-based defaults when columns are absent
+      if (!familyType   && fileType !== "unknown") familyType   = FILE_TYPE_FAMILY[fileType]   ?? "";
+      if (!materialType && fileType !== "unknown") materialType = FILE_TYPE_MATERIAL_TYPE[fileType] ?? "";
+      if (!isLiquid     && fileType !== "unknown") isLiquid     = FILE_TYPE_IS_LIQUID[fileType]     ?? "";
+      const waterContrib = pick(raw, colMap, "WATER_CONTRIB");
+      const cost         = pick(raw, colMap, "COST");
+      let   costUnits    = String(pick(raw, colMap, "COST_UNITS")        ?? "").trim();
+      const plantCode    = String(pick(raw, colMap, "PLANT")             ?? "").trim();
+      const dateRaw      = pick(raw, colMap, "DATE");
+      const manufacturer = String(pick(raw, colMap, "MANUFACTURER")      ?? "").trim();
+      const mfrSource    = String(pick(raw, colMap, "MFR_SOURCE")        ?? "").trim();
+      const batchOrder   = pick(raw, colMap, "BATCH_ORDER");
+      const itemDesc     = String(pick(raw, colMap, "ITEM_DESC")         ?? "").trim();
+      const itemShort    = String(pick(raw, colMap, "ITEM_SHORT_DESC")   ?? "").trim();
+      let   itemCat      = String(pick(raw, colMap, "ITEM_CATEGORY")     ?? "").trim();
+      const itemCatDesc  = String(pick(raw, colMap, "ITEM_CAT_DESC")     ?? "").trim();
+      const itemCatShort = String(pick(raw, colMap, "ITEM_CAT_SHORT")    ?? "").trim();
+      const batchPanel   = String(pick(raw, colMap, "BATCH_PANEL")       ?? "").trim();
+
+      // ── T2: Family Type auto-correction ────────────────────────────────
+      const matLower = materialType.toLowerCase();
+      const correctedFamily = MATERIAL_TYPE_TO_FAMILY[matLower];
+      if (correctedFamily && familyType !== correctedFamily) {
+        allIssues.push({
+          type: "warning",
+          message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Family Type corrected from '${familyType || "(empty)"}' to '${correctedFamily}' based on Material Type '${materialType}'.`,
+          row: dataRowNum,
+          field: "Family Material Type",
+        });
+        familyType = correctedFamily;
+        if (itemCat && itemCat !== correctedFamily) {
+          itemCat = correctedFamily;
+        }
+      }
+
+      // ── Validation: Plant, Family Type, Material Type ───────────────────
+      if (!plantCode) {
+        allIssues.push({
+          type: "warning",
+          message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Plant Code is blank — material may fail database import.`,
+          row: dataRowNum,
+          field: "Plant Code (Required)",
+        });
+      }
+      if (!familyType) {
+        allIssues.push({
+          type: "warning",
+          message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Family Material Type is blank.`,
+          row: dataRowNum,
+          field: "Family Material Type (Required)",
+        });
+      } else if (!VALID_FAMILY_TYPES.has(familyType.toLowerCase())) {
+        allIssues.push({
+          type: "warning",
+          message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Family Material Type '${familyType}' is not recognized. Valid values: Cement, Mineral, Aggregate, Admixture & Fiber, Water.`,
+          row: dataRowNum,
+          field: "Family Material Type (Required)",
+        });
+      }
+      if (!materialType) {
+        allIssues.push({
+          type: "warning",
+          message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Material Type is blank.`,
+          row: dataRowNum,
+          field: "Material Type (Required)",
+        });
+      }
+      if (tradeName.length > 70) {
+        allIssues.push({
+          type: "warning",
+          message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Trade Name exceeds 70 characters (${tradeName.length}).`,
+          row: dataRowNum,
+          field: "Trade Name (Required)",
+        });
+      }
+
+      // ── T3: Specific Gravity default for Admixture & Fiber ─────────────
+      const sgRaw = sg === null || sg === "" || sg === undefined ? null : Number(sg);
+      let finalSG: number | null = (sgRaw !== null && !isNaN(sgRaw)) ? sgRaw : null;
+
+      if (finalSG === null && familyType === "Admixture & Fiber") {
+        finalSG = 1;
+      }
+
+      // CHECK 3: Specific Gravity required and in range 0.4–10.0
+      if (finalSG === null || isNaN(finalSG) || finalSG < 0.4 || finalSG >= 10.0) {
+        allIssues.push({
+          type: "error",
+          message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Specific Gravity must be 0.4 or greater and less than 10.0 (got ${finalSG ?? "missing"}) — row skipped.`,
+          row: dataRowNum,
+          field: "Specific Gravity (Required)",
+        });
+        totalSkipped++;
+        continue;
+      }
+
+      // ── T4: Cost Units default ──────────────────────────────────────────
+      if (!costUnits) costUnits = "$/lb";
+
+      // ── Validation: Cost, Cost Units, Batch Order, Mfr Source ──────────
+      const costNum = (cost === null || cost === undefined || cost === "") ? null : Number(cost);
+      if (costNum !== null && !isNaN(costNum) && costNum < 0) {
+        allIssues.push({
+          type: "error",
+          message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Cost must be 0.0 or greater (got ${costNum}).`,
+          row: dataRowNum,
+          field: "Cost",
+        });
+      }
+      if (costNum !== null && !isNaN(costNum) && costNum >= 0 &&
+          !VALID_COST_UNITS.has(costUnits.toLowerCase())) {
+        allIssues.push({
+          type: "warning",
+          message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Cost Unit '${costUnits}' is not in the recognized list. Common valid units: $/lb, $/gal, $/ton, $/kg, $/liter.`,
+          row: dataRowNum,
+          field: "Cost Units",
+        });
+      }
+      const batchOrderStr = String(batchOrder ?? "").trim();
+      if (batchOrderStr && isNaN(Number(batchOrderStr))) {
+        allIssues.push({
+          type: "error",
+          message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Batching Order Number '${batchOrderStr}' must be numeric.`,
+          row: dataRowNum,
+          field: "Batching Order Number",
+        });
+      }
+      if (mfrSource.length > 50) {
+        allIssues.push({
+          type: "warning",
+          message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Manufacturer Source Name exceeds 50 characters (${mfrSource.length}).`,
+          row: dataRowNum,
+          field: "Manufacturer Source",
+        });
+      }
+
+      // ── T5: Production Item Code cleanup ───────────────────────────────
+      const cleanItemCode = itemCode.replace(/\s+/g, "");
+
+      // ── T1: Date format ─────────────────────────────────────────────────
+      const formattedDate = formatDate(dateRaw);
+
+      // Build output row in fixed OUTPUT_HEADERS order
+      const out: any[] = new Array(OUTPUT_HEADERS.length).fill(null);
+      out[COL.PLANT]            = plantCode    || null;
+      out[COL.TRADE_NAME]       = tradeName;
+      out[COL.DATE]             = formattedDate;
+      out[COL.FAMILY_TYPE]      = familyType   || null;
+      out[COL.MATERIAL_TYPE]    = materialType || null;
+      out[COL.SPECIFIC_GRAVITY] = finalSG;
+      out[COL.IS_LIQUID]        = isLiquid     || null;
+      out[COL.WATER_CONTRIB]    = (waterContrib === "" || waterContrib === undefined) ? null : waterContrib;
+      out[COL.COST]             = (cost         === "" || cost         === undefined) ? null : cost;
+      out[COL.COST_UNITS]       = costUnits     || null;
+      out[COL.MANUFACTURER]     = manufacturer  || null;
+      out[COL.MFR_SOURCE]       = mfrSource     || null;
+      out[COL.BATCH_ORDER]      = (batchOrder   === "" || batchOrder   === undefined) ? null : batchOrder;
+      out[COL.ITEM_CODE]        = cleanItemCode || null;
+      out[COL.ITEM_DESC]        = itemDesc      || null;
+      out[COL.ITEM_SHORT_DESC]  = itemShort     || null;
+      out[COL.ITEM_CATEGORY]    = itemCat       || null;
+      out[COL.ITEM_CAT_DESC]    = itemCatDesc   || null;
+      out[COL.ITEM_CAT_SHORT]   = itemCatShort  || null;
+      out[COL.BATCH_PANEL]      = batchPanel    || null;
+
+      allDataRows.push(out);
+    }
+  }
+
+  // ── POST-MERGE: CHECK 4 — Duplicate Trade Name per Plant ────────────────
+  const tradeNameSeen    = new Map<string, number>();
+  const dupTradeNameRows = new Set<number>();
+
+  allDataRows.forEach((row, i) => {
+    const key = `${String(row[COL.PLANT] ?? "").trim().toUpperCase()}||${String(row[COL.TRADE_NAME] ?? "").trim().toUpperCase()}`;
+    if (tradeNameSeen.has(key)) {
+      dupTradeNameRows.add(i);
+    } else {
+      tradeNameSeen.set(key, i);
+    }
+  });
+
+  // ── POST-MERGE: CHECK 5 — Duplicate Item Code per Plant ─────────────────
+  const itemCodeSeen    = new Map<string, number>();
+  const dupItemCodeRows = new Set<number>();
+
+  allDataRows.forEach((row, i) => {
+    const code = String(row[COL.ITEM_CODE] ?? "").trim().toUpperCase();
+    if (!code) return;
+    const key = `${String(row[COL.PLANT] ?? "").trim().toUpperCase()}||${code}`;
+    if (itemCodeSeen.has(key)) {
+      dupItemCodeRows.add(i);
+    } else {
+      itemCodeSeen.set(key, i);
+    }
+  });
+
+  // Collect human-readable labels for reporting
+  const dupTradeNameLabels = new Set<string>();
+  Array.from(dupTradeNameRows).forEach((i) => {
+    dupTradeNameLabels.add(
+      `Plant ${String(allDataRows[i][COL.PLANT] ?? "").trim()}: "${String(allDataRows[i][COL.TRADE_NAME] ?? "").trim()}"`
+    );
+  });
+
+  const dupItemCodeLabels = new Set<string>();
+  Array.from(dupItemCodeRows).forEach((i) => {
+    dupItemCodeLabels.add(
+      `Plant ${String(allDataRows[i][COL.PLANT] ?? "").trim()}: item code "${String(allDataRows[i][COL.ITEM_CODE] ?? "").trim()}"`
+    );
+  });
+
+  // Remove duplicates (keep first occurrence)
+  const rowsToRemove = new Set([
+    ...Array.from(dupTradeNameRows),
+    ...Array.from(dupItemCodeRows),
+  ]);
+  const cleanedRows = allDataRows.filter((_, i) => !rowsToRemove.has(i));
+
+  Array.from(dupTradeNameLabels).forEach((label) => {
+    allIssues.push({
+      type: "error",
+      message: `Duplicate Trade Name removed — ${label} appeared more than once in the same plant. Kept first occurrence.`,
+      field: "Trade Name",
+    });
+  });
+  Array.from(dupItemCodeLabels).forEach((label) => {
+    allIssues.push({
+      type: "error",
+      message: `Duplicate Production Item Code removed — ${label} appeared more than once in the same plant. Kept first occurrence.`,
+      field: "Production Item Code",
+    });
+  });
+
+  totalSkipped += rowsToRemove.size;
+
+  return {
+    rows: [OUTPUT_HEADERS, ...cleanedRows],
+    issues: allIssues,
+    totalInputRows,
+    totalOutputRows: cleanedRows.length,
+    skippedRows: totalSkipped,
+  };
+}

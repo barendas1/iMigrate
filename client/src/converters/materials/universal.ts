@@ -1399,8 +1399,10 @@ export function convertAndMergeMaterials(
         continue;
       }
 
-      // ── T4: Cost Units default ──────────────────────────────────────────
-      if (!costUnits) costUnits = "$/lb";
+      // ── T4: Cost Units default — only when cost is actually provided ────
+      const hasCost = cost !== null && cost !== undefined && cost !== "";
+      if (hasCost && !costUnits) costUnits = "$/lb";
+      if (!hasCost) costUnits = "";
 
       // ── Validation: Cost, Cost Units, Batch Order, Mfr Source ──────────
       const costNum = (cost === null || cost === undefined || cost === "") ? null : Number(cost);
@@ -1469,12 +1471,12 @@ export function convertAndMergeMaterials(
       out[COL.MFR_SOURCE]       = mfrSource     || null;
       out[COL.BATCH_ORDER]      = (batchOrder   === "" || batchOrder   === undefined) ? null : batchOrder;
       out[COL.ITEM_CODE]        = cleanItemCode || null;
-      out[COL.ITEM_DESC]        = itemDesc      || null;
+      out[COL.ITEM_DESC]        = itemDesc      || tradeName || null;
       out[COL.ITEM_SHORT_DESC]  = itemShort     || null;
       out[COL.ITEM_CATEGORY]    = itemCat       || null;
       out[COL.ITEM_CAT_DESC]    = itemCatDesc   || null;
       out[COL.ITEM_CAT_SHORT]   = itemCatShort  || null;
-      out[COL.BATCH_PANEL]      = batchPanel    || null;
+      out[COL.BATCH_PANEL]      = batchPanel    || cleanItemCode || null;
 
       allDataRows.push(out);
     }

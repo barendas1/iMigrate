@@ -330,6 +330,299 @@ function inferFileType(headerRow: any[]): FileType {
   return "unknown";
 }
 
+// ---------------------------------------------------------------------------
+// Maps any raw family-type string (however abbreviated) to a valid DB value.
+// Returns null if no confident match can be made.
+// ---------------------------------------------------------------------------
+function normalizeFamilyType(raw: string): string | null {
+  const v = raw.trim().toLowerCase();
+  if (!v) return null;
+  if (v === "cement")                                        return "Cement";
+  if (v === "mineral")                                       return "Mineral";
+  if (v === "aggregate")                                     return "Aggregate";
+  if (v === "admixture & fiber" || v === "admixture and fiber") return "Admixture & Fiber";
+  if (v === "water")                                         return "Water";
+  // Aggregate signals
+  if (v.includes("agg")       || v.includes("gravel")   || v.includes("stone")  ||
+      v.includes("sand")      || v.includes("rock")      || v.includes("granite") ||
+      v.includes("limestone") || v.includes("limerock")  || v.includes("coarse") ||
+      v.includes("pea")       || v.includes("pebble")    || v.includes("screenings") ||
+      v.includes("chip"))
+    return "Aggregate";
+  // Mineral / SCM signals (fly ash, slag, silica fume, GGBF, pozzolan)
+  if (v.includes("fly ash") || v.includes("flyash") || v.includes("slag") ||
+      v.includes("ggbf")    || v.includes("silica")  || v.includes("pozzolan") ||
+      v.includes("mineral") || v.includes("scm"))
+    return "Mineral";
+  // Cement signals
+  if (v.includes("cement") || v === "cem" || v.startsWith("cem "))
+    return "Cement";
+  // Admixture & Fiber signals
+  if (v.includes("admix")       || v.includes("additive")     || v.includes("chemical") ||
+      v.includes("fiber")       || v.includes("fibre")        || v.includes("retard")   ||
+      v.includes("accelerat")   || v.includes("plasticizer")  || v.includes("superplast") ||
+      v.includes("shrink")      || v.includes("pigment")      || v.includes("color")    ||
+      v.includes("colour")      || v.includes("air entraining") || v.includes("water reduc") ||
+      v.includes("set time")    || v.includes("viscosity"))
+    return "Admixture & Fiber";
+  // Water signals
+  if (v.includes("water") || v === "h2o")
+    return "Water";
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Complete list of valid material type strings (exact database names).
+// Grouped by family type for documentation; order doesn't affect matching.
+// ---------------------------------------------------------------------------
+const VALID_MATERIAL_TYPES: readonly string[] = [
+  // ── Cement ────────────────────────────────────────────────────────────────
+  "Cement","Type I","Type II","Type III","Type I-II","Type II-V","Type IV","Type V",
+  "Type GU","Type IL","Type IP","Type IP (MS)","Type IS","Type P","Type I(PM)","Type I(SM)",
+  "Expansive Type K","Expansive Type M","Expansive Type S","SSPWC Expansive Cement",
+  "Rapid Set","CSA Type GU","CSA Type GUb-F/SF","CSA Type GUb-S","CSA Type Gub-SF",
+  "CSA Type GUL","CSA Type GULb","CSA Type HE","CSA Type HS","CSA Type LH",
+  "CSA Type MH","CSA Type MS","CSA Special Cement","NZS GB","NZS GP","NZS HE",
+  "Cement Blends","Fixed Cement Blends","Variable Cement Blends",
+  "BS EN 197-1 (Cem I)","32.5 N","32.5 R","42.5 N","42.5 R","52.5 N","52.5 R",
+  // ── Mineral ───────────────────────────────────────────────────────────────
+  "CSA ANHYDRITE","CSA Type BMb","Integral Concrete Hardener",
+  "Fly Ash (General)","Fly Ash","Fly Ash C","Fly Ash F","Natural Pozz N",
+  "CSA Fly Ash","CSA Type CH","CSA Type CI","CSA Type F","CSA Type N","Superfine Fly Ash",
+  "Slag (General)","BS 6699 GGBS","CSA Type S","Slag","Superfine Slag",
+  "Metakaolin (General)","CSA Type N - Meta-Kaolin","Metakaolin",
+  "Hydrated Lime","Type N","Type NA","Type S","Type SA",
+  "Silica Fume (General)","CSA Silica Fume","CSA Type SF","CSA Type SFI",
+  "Silica Fume","Silica Fume Dry","Silica Fume Slurry",
+  // ── Aggregate (Coarse) ────────────────────────────────────────────────────
+  "Coarse Aggregate (General)","Coarse Aggregate",
+  "0.185\"","ACI No. 4 to No. 8","Cemex 3/16\" to No. 8","1/4\"",
+  "BS EN 2/6.3 mm","BS Single-Sized 5 mm","CSA.GII 5-2.5","OPS 6.7 mm Structural",
+  "3/8 \"","# 8","# 89","#89NH","Aurora 3/8\" Granular Bedding",
+  "BS EN 4/10 mm","BS Single-Sized 10 mm","CSA.GI 10-2.5 Granite",
+  "CSA.GI 10-2.5 Gravel","CSA.GI 10-2.5 Limestone","CSA.GII 10-5",
+  "ISSA Type II Slurry Seal","NZS CA 10","NZS Company CA 10",
+  "ODOT 3/8\" to No. 4","OPS 9.5 mm Structural","SSPWC No. 4",
+  "1/2 \"","# 7","# 78","1/2\" to No. 4","CDOT Class 6","SCDOT # 789",
+  "17/32\"","BS EN 2/14 mm","BS EN 6.3/14 mm","BS Graded 14 mm to 5 mm",
+  "BS Single-Sized 14 mm","CSA.GI 14-5 Granite","CSA.GI 14-5 Gravel",
+  "CSA.GI 14-5 Limestone","CSA.GII 14-10","NZS CA 13","NZS Company CA 13",
+  "OPS 13.2 mm Pavement","OPS 13.2 mm Structural","5/8\"","NZS CA 16",
+  "OPS 16 mm Structural","3/4 \"","# 6","# 67",
+  "BS EN 4/20 mm","BS EN 10/20 mm","BS Graded 20 mm to 5 mm","BS Single-Sized 20 mm",
+  "CDOT Class 7","CSA.GI 20-5 Granite","CSA.GI 20-5 Gravel","CSA.GI 20-5 Limestone",
+  "CSA.GII 20-10 Granite","CSA.GII 20-10 Limestone","NZS CA 19","NZS Company CA 19",
+  "ODOT 3/4\" Base","ODOT 3/4\" to 3/8\"","OPS 19 mm Pavement","OPS 19 mm Structural",
+  "1 \"","# 5","# 56","# 57","Aurora Type IIA Base","CDOT Class 5",
+  "CDOT Class B Filter","CSA.GI 28-5","CSA.GII 28-14","NZS CA 26","SSPWC No. 3",
+  "1 1/2 \"","# 4","# 467","BS EN 4/40 mm","BS EN 20/40 mm",
+  "BS Graded 40 mm to 5 mm","BS Single-Sized 40 mm","CSA.GI 40-5",
+  "CSA.GII 40-20 Granite","CSA.GII 40-20 Limestone","NZS CA 38",
+  "OPS 37.5 mm Pavement","OPS 37.5 - 19 mm Pavement","SSPWC No. 2",
+  "2 \"","# 3","# 357","CDOT Class 1","CDOT Class 1 Structural Fill",
+  "CDOT Class 4","CDOT Str. Backfill Class 1","CSA.GII 56-28",
+  "2 1/2 \"","# 2","CSA.GII 80-40","NZS CA 75",
+  "3 1/2 \"","# 1","CDOT Class 2","CDOT Class A Filter","CDOT Type II Bedding","CDOT Class 3",
+  "Rip Rap","4\" Rip Rap","Rap 4","6\" Rip Rap","Rap 6","VL Rip Rap",
+  "8\" Rip Rap","Rap 8","9\" Rip Rap","L Rip Rap","10\" Rip Rap","Rap 10",
+  "12\" Rip Rap","M Rip Rap","Rap 12","18\" Rip Rap","H Rip Rap","24\" Rip Rap","VH Rip Rap",
+  "Coarse Lightweight","3/8 in to No 8 Lwt","1/2\" Lightweight",
+  "1/2 in to No 4 Lwt","3/4 in to No 4 Lwt","1 in to No 4 Lwt",
+  "SSPWC No. 2 Lightweight","Ballast","CR 3-4","MBTA4","MBTA4A",
+  "Coarse High Density","Structural Fill","Stone Blends","Intermediate Aggregate",
+  // ── Aggregate (Fine) ──────────────────────────────────────────────────────
+  "Fine Aggregate (General)","BS EN Fine Aggregate",
+  "BS EN 0/4 (CP) mm","BS EN 0/4 (MP) mm","BS EN 0/2 (MP) mm",
+  "BS EN 0/2 (FP) mm","BS EN 0/1 (FP) mm","BS Fine Aggregate",
+  "BS Sand C","BS Sand M","BS Sand F","CSA Fine Aggregate","CSA FA1","CSA FA2",
+  "CSA Fillers","Fine Aggregate","Blended Sand","Commercial Sand",
+  "Manufactured Sand","Natural Sand","20-30 (Ottawa LeSeuer) Sand",
+  "Graded (Ottawa) Sand","PCC Sand","Fines","304.1 Sand","Dust",
+  "Screenings","Silt","Fine Lightweight","No 4 to 0 Lwt",
+  "Masonry Sand","Manufactured Masonry Sand","Natural Masonry Sand",
+  "NZS Fine Aggregate","NZS Company PAP6","# 9","AASHTO M6","CDOT Sand",
+  "Fine High Density","Grit","OPS Manufactured Sand","OPS Natural Sand",
+  "SSPWC Sand","WSDOT Sand","Sand Blends",
+  // ── Aggregate (Combined / Gravel / Special) ───────────────────────────────
+  "Combined Fine Coarse (General)","Combined Fine Crse Lwt",
+  "3/8 in to 0 Lwt","1/2 in to 0 Lwt","Dense Graded",
+  "1 1/2\" Dense MHD","3/4\" Dense MHD","Gravel",
+  "304.2","304.3","304.33","304.4","304.5","304.6","P-154","P-209",
+  "Processed Gravel MHD","Septic Gravel MHD","Type A MHD","Type B MHD","Type C MHD",
+  "Recycled Aggs","Crushed Bank","Crushed Concrete",
+  "Reclaimed Base NHDOT","Reclaimed Borrow (MHD)","T-Base",
+  "Special Blends","Lightweight Aggregate","Combined Aggregate Blends",
+  // ── Water ─────────────────────────────────────────────────────────────────
+  "City","Cold Water","Drinking","Flaked Ice","Hot Water",
+  "Potable","Questionable","Recycled","Well Water",
+  // ── Admixture & Fiber ─────────────────────────────────────────────────────
+  "Air Detrainer","Air Entrainer","Anti-Washout","ASR Mitigation","CarbonCure",
+  "Color","Corrosion Inhibitor","Foaming Agent","Grout Fluidifier",
+  "Hydration Stabilizer","Latex Emulsion","Mid Range Water Reducer",
+  "Multi-Range Water Reducer","Pump Aid - Integral","Shrinkage Reducer",
+  "Shrinkage Reducer And Compensator","Stabilizer","Strength Enhancing Admixture",
+  "Type A & D Water Reducer","Type A Water Reducer","Type B Retarder",
+  "Type C Accelerator","Calcium Chloride Accelerator","Non-Chloride Accelerator",
+  "Type D Water Reducer & Retarder","Type E Water Reducer & Accelerator",
+  "Type F High Range Water Reducer","Type G High Range Water Reducer & Retarder",
+  "Type S Specific Performance","Viscosity Modifier","Viscosity Modifier/HRWR",
+  "Water Proofer","Water Proofer - Crystalizing","Water Proofer - Integral",
+  "Water Repellent","Fibers","Blended Fibers","Glass Fibers",
+  "Natural Fibers","Steel Fibers","Structural Fibers","Synthetic Fibers",
+] as const;
+
+// O(1) case-insensitive exact lookup: lowercase → canonical name
+const MATERIAL_TYPE_EXACT = new Map<string, string>(
+  (VALID_MATERIAL_TYPES as readonly string[]).map((t) => [t.toLowerCase(), t])
+);
+
+// ---------------------------------------------------------------------------
+// Maps any raw material-type string to a valid DB name.
+// Uses familyType context to resolve ambiguous matches.
+// Returns null when no confident match exists.
+// ---------------------------------------------------------------------------
+function normalizeMaterialType(raw: string, familyType?: string): string | null {
+  const v = raw.trim();
+  if (!v) return null;
+
+  // Step 1: exact match (case-insensitive)
+  const exact = MATERIAL_TYPE_EXACT.get(v.toLowerCase());
+  if (exact) return exact;
+
+  const vl = v.toLowerCase();
+
+  // Step 2: common shorthand/abbreviation lookup
+  const abbrevMap: Record<string, string> = {
+    // Aggregate shorthands
+    "coarseagg": "Coarse Aggregate", "coarse agg": "Coarse Aggregate",
+    "fineagg":   "Fine Aggregate",   "fine agg":   "Fine Aggregate",
+    "sand":      "Natural Sand",     "stone":      "Coarse Aggregate",
+    "gravel":    "Gravel",
+    // Cement shorthands
+    "cem":    "Cement",
+    "type1":  "Type I",   "type 1": "Type I",
+    "type2":  "Type II",  "type 2": "Type II",
+    "type3":  "Type III", "type 3": "Type III",
+    // Mineral shorthands
+    "flyash":      "Fly Ash",    "fly ash":     "Fly Ash",
+    "flyashc":     "Fly Ash C",  "flyashf":     "Fly Ash F",
+    "slag":        "Slag",       "ggbf":        "Slag (General)",
+    "ggbs":        "BS 6699 GGBS",
+    "silica fume": "Silica Fume","microsilica":  "Silica Fume",
+    "metakaolin":  "Metakaolin", "lime":         "Hydrated Lime",
+    // Water shorthands
+    "citywater":  "City",      "city water": "City",
+    "coldwater":  "Cold Water","hotwater":   "Hot Water",
+    "hot water":  "Hot Water", "well water": "Well Water",
+    "water":      "City",
+    // Admixture shorthands
+    "aea":      "Air Entrainer",  "air entraining": "Air Entrainer",
+    "hrwr":     "Type F High Range Water Reducer",
+    "hrwra":    "Type F High Range Water Reducer",
+    "wrda":     "Type A Water Reducer",
+    "retarder": "Type B Retarder",
+    "accelerator": "Type C Accelerator",
+    "calcium chloride": "Calcium Chloride Accelerator",
+    "cacl": "Calcium Chloride Accelerator", "cacl2": "Calcium Chloride Accelerator",
+    "fiber": "Synthetic Fibers", "fibre": "Synthetic Fibers",
+    "color": "Color", "colour": "Color", "pigment": "Color",
+    "shrinkage": "Shrinkage Reducer", "viscosity": "Viscosity Modifier",
+    "corrosion": "Corrosion Inhibitor",
+    // Aggregate trade-name patterns
+    "masonsand": "Masonry Sand", "mason sand": "Masonry Sand",
+    "masonrysand": "Masonry Sand", "masonry sand": "Masonry Sand",
+    "pea gravel": "Gravel", "peasand": "Natural Sand", "pea sand": "Natural Sand",
+    // Admixture abbreviations common in trade names
+    "nca":  "Non-Chloride Accelerator",
+    "cc":   "Calcium Chloride Accelerator",
+    "ncc":  "Non-Chloride Accelerator",
+    "wra":  "Type A Water Reducer",
+    "mwr":  "Mid Range Water Reducer",
+    "pci":  "Pump Aid - Integral",
+    "chloride": "Calcium Chloride Accelerator",
+    "non-chloride": "Non-Chloride Accelerator",
+    "asr":  "ASR Mitigation",
+    // Water trade-name patterns
+    "citywat": "City", "coldwat": "Cold Water", "hotwat": "Hot Water",
+  };
+  if (abbrevMap[vl]) return abbrevMap[vl];
+
+  // Step 3: keyword fuzzy matching scoped to family type
+  if (familyType === "Aggregate") {
+    if (vl.includes("coarse") || vl.includes("stone") || vl.includes("rock") ||
+        vl.includes("granite") || vl.includes("limestone") || vl.includes("gravel"))
+      return "Coarse Aggregate";
+    if (vl.includes("fine") || vl.includes("sand"))  return "Fine Aggregate";
+    if (vl.includes("light"))   return "Coarse Lightweight";
+    if (vl.includes("recycle")) return "Recycled Aggs";
+    if (vl.includes("crush"))   return "Crushed Concrete";
+    if (vl.includes("rip rap")) return "Rip Rap";
+    return "Coarse Aggregate"; // safe fallback within Aggregate
+  }
+
+  if (familyType === "Cement") {
+    if (vl.includes("type i-ii") || vl.includes("type1-2")) return "Type I-II";
+    if (vl.includes("type iii") || vl.includes("type3"))    return "Type III";
+    if (vl.includes("type ii")  || vl.includes("type2"))    return "Type II";
+    if (vl.includes("type i")   || vl.includes("type1"))    return "Type I";
+    if (vl.includes("type v"))  return "Type V";
+    if (vl.includes("blend"))   return "Cement Blends";
+    if (vl.includes("rapid"))   return "Rapid Set";
+    if (vl.includes("expan"))   return "Expansive Type K";
+    return "Cement"; // safe fallback within Cement
+  }
+
+  if (familyType === "Mineral") {
+    if (vl.includes("fly ash") || vl.includes("flyash"))  return "Fly Ash";
+    if (vl.includes("slag") || vl.includes("ggbf") || vl.includes("ggbs")) return "Slag";
+    if (vl.includes("silica fume") || vl.includes("microsilica")) return "Silica Fume";
+    if (vl.includes("metakaolin")) return "Metakaolin";
+    if (vl.includes("lime"))       return "Hydrated Lime";
+    if (vl.includes("pozzolan"))   return "Natural Pozz N";
+    return null; // too many mineral subtypes to guess safely
+  }
+
+  if (familyType === "Water") {
+    if (vl.includes("cold"))             return "Cold Water";
+    if (vl.includes("hot"))              return "Hot Water";
+    if (vl.includes("recycle"))          return "Recycled";
+    if (vl.includes("well"))             return "Well Water";
+    if (vl.includes("potable") || vl.includes("drink")) return "Potable";
+    if (vl.includes("ice"))              return "Flaked Ice";
+    return "City"; // safe fallback within Water
+  }
+
+  if (familyType === "Admixture & Fiber") {
+    if (vl.includes("air entrain"))    return "Air Entrainer";
+    if (vl.includes("air detrain"))    return "Air Detrainer";
+    if (vl.includes("high range") || vl.includes("hrwr")) return "Type F High Range Water Reducer";
+    if (vl.includes("mid range") || vl.includes("mrwr"))  return "Mid Range Water Reducer";
+    if (vl.includes("retard"))         return "Type B Retarder";
+    if (vl.includes("calcium chloride") || vl.includes("cacl")) return "Calcium Chloride Accelerator";
+    if (vl.includes("accelerat"))      return "Type C Accelerator";
+    if (vl.includes("water reduc"))    return "Type A Water Reducer";
+    if (vl.includes("shrinkage"))      return "Shrinkage Reducer";
+    if (vl.includes("viscosity"))      return "Viscosity Modifier";
+    if (vl.includes("steel fiber") || vl.includes("steel fibre")) return "Steel Fibers";
+    if (vl.includes("synthetic fiber") || vl.includes("synthetic fibre")) return "Synthetic Fibers";
+    if (vl.includes("glass fiber") || vl.includes("glass fibre")) return "Glass Fibers";
+    if (vl.includes("fiber") || vl.includes("fibre")) return "Synthetic Fibers";
+    if (vl.includes("color") || vl.includes("colour") || vl.includes("pigment")) return "Color";
+    if (vl.includes("corrosion"))      return "Corrosion Inhibitor";
+    if (vl.includes("waterproof") || vl.includes("water proof")) return "Water Proofer";
+    if (vl.includes("water repel"))    return "Water Repellent";
+    if (vl.includes("stabiliz"))       return "Stabilizer";
+    if (vl.includes("latex"))          return "Latex Emulsion";
+    if (vl.includes("asr"))            return "ASR Mitigation";
+    if (vl.includes("pump"))           return "Pump Aid - Integral";
+    if (vl.includes("foaming"))        return "Foaming Agent";
+    if (vl.includes("strength"))       return "Strength Enhancing Admixture";
+    return null; // too many admixture types to guess without more info
+  }
+
+  return null;
+}
+
 // Default Family Type per file type
 const FILE_TYPE_FAMILY: Partial<Record<FileType, string>> = {
   cement:    "Cement",
@@ -510,8 +803,13 @@ function resolveColumns(
       outer:
       for (const [norm, idx] of Array.from(inputMap.entries())) {
         for (const alias of ALIASES[fieldKey]) {
-          // Require alias length >= 3 to avoid false positives on short strings
-          if (alias.length >= 3 && (norm.includes(alias) || (alias.length >= norm.length && alias.includes(norm)))) {
+          // norm.includes(alias): header contains alias as substring
+          // alias.includes(norm): alias contains abbreviated header —
+          //   require norm.length >= 4 so "id" never matches "plant id" etc.
+          if (alias.length >= 3 && (
+            norm.includes(alias) ||
+            (norm.length >= 4 && alias.length >= norm.length && alias.includes(norm))
+          )) {
             resolved.set(fieldKey, idx);
             break outer;
           }
@@ -846,7 +1144,7 @@ export function convertAndMergeMaterials(
       // Apply file-type-based defaults when columns are absent
       if (!familyType   && fileType !== "unknown") familyType   = FILE_TYPE_FAMILY[fileType]   ?? "";
       if (!materialType && fileType !== "unknown") materialType = FILE_TYPE_MATERIAL_TYPE[fileType] ?? "";
-      if (!isLiquid     && fileType !== "unknown") isLiquid     = FILE_TYPE_IS_LIQUID[fileType]     ?? "";
+
       const waterContrib = pick(raw, colMap, "WATER_CONTRIB");
       const cost         = pick(raw, colMap, "COST");
       let   costUnits    = String(pick(raw, colMap, "COST_UNITS")        ?? "").trim();
@@ -862,7 +1160,27 @@ export function convertAndMergeMaterials(
       const itemCatShort = String(pick(raw, colMap, "ITEM_CAT_SHORT")    ?? "").trim();
       const batchPanel   = String(pick(raw, colMap, "BATCH_PANEL")       ?? "").trim();
 
-      // ── T2: Family Type auto-correction ────────────────────────────────
+      // ── Family Type normalization ───────────────────────────────────────
+      // Step 1: if family type is missing, try to derive from material type name
+      if (!familyType && materialType) {
+        const derived = normalizeFamilyType(materialType);
+        if (derived) familyType = derived;
+      }
+      // Step 2: if family type exists but isn't a valid value, try to map it
+      if (familyType && !VALID_FAMILY_TYPES.has(familyType.toLowerCase())) {
+        const normalized = normalizeFamilyType(familyType);
+        if (normalized) {
+          allIssues.push({
+            type: "warning",
+            message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Family Material Type '${familyType}' corrected to '${normalized}'.`,
+            row: dataRowNum,
+            field: "Family Material Type",
+          });
+          familyType = normalized;
+        }
+      }
+
+      // ── T2: Specific material-type-based family overrides ──────────────
       const matLower = materialType.toLowerCase();
       const correctedFamily = MATERIAL_TYPE_TO_FAMILY[matLower];
       if (correctedFamily && familyType !== correctedFamily) {
@@ -878,7 +1196,43 @@ export function convertAndMergeMaterials(
         }
       }
 
+      // ── Material Type normalization ────────────────────────────────────
+      // Try raw material type first; if that can't be resolved, fall back to
+      // the trade name as a hint (trade names often reveal the specific type
+      // when the material type column only has a generic abbreviation like ADMIX).
+      {
+        const fromRaw   = normalizeMaterialType(materialType, familyType);
+        const fromName  = fromRaw ?? normalizeMaterialType(tradeName, familyType);
+        const finalMT   = fromName;
+
+        if (finalMT && finalMT !== materialType) {
+          // Only emit a warning when the original wasn't already a valid cased match
+          if (materialType && !MATERIAL_TYPE_EXACT.has(materialType.toLowerCase())) {
+            const hint = !fromRaw ? " (derived from Trade Name)" : "";
+            allIssues.push({
+              type: "warning",
+              message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Material Type '${materialType}' mapped to '${finalMT}'${hint}.`,
+              row: dataRowNum,
+              field: "Material Type (Required)",
+            });
+          }
+          materialType = finalMT;
+        } else if (!finalMT && materialType && !MATERIAL_TYPE_EXACT.has(materialType.toLowerCase())) {
+          allIssues.push({
+            type: "warning",
+            message: `${prefix}Row ${dataRowNum} ('${tradeName}'): Material Type '${materialType}' is not recognized and could not be determined from the Trade Name — leaving blank.`,
+            row: dataRowNum,
+            field: "Material Type (Required)",
+          });
+          materialType = "";
+        } else if (finalMT && finalMT !== materialType) {
+          // Silent case-correction (value was valid but wrong case)
+          materialType = finalMT;
+        }
+      }
+
       // ── Validation: Plant, Family Type, Material Type ───────────────────
+      // Plant: leave blank — never copy item code into plant
       if (!plantCode) {
         allIssues.push({
           type: "warning",
@@ -919,12 +1273,12 @@ export function convertAndMergeMaterials(
         });
       }
 
-      // ── T3: Specific Gravity default for Admixture & Fiber ─────────────
+      // ── T3: Specific Gravity — default to 1 when not provided ───────────
       const sgRaw = sg === null || sg === "" || sg === undefined ? null : Number(sg);
       let finalSG: number | null = (sgRaw !== null && !isNaN(sgRaw)) ? sgRaw : null;
 
-      if (finalSG === null && familyType === "Admixture & Fiber") {
-        finalSG = 1;
+      if (finalSG === null) {
+        finalSG = 1; // use 1 as a safe neutral SG when not provided
       }
 
       // CHECK 3: Specific Gravity required and in range 0.4–10.0
@@ -982,8 +1336,16 @@ export function convertAndMergeMaterials(
       // ── T5: Production Item Code cleanup ───────────────────────────────
       const cleanItemCode = itemCode.replace(/\s+/g, "");
 
-      // ── T1: Date format ─────────────────────────────────────────────────
-      const formattedDate = formatDate(dateRaw);
+      // ── T1: Date format — default to today when not provided ────────────
+      const formattedDate = formatDate(dateRaw) || (() => {
+        const d  = new Date();
+        const mm = String(d.getMonth() + 1).padStart(2, "0");
+        const dd = String(d.getDate()).padStart(2, "0");
+        return `${mm}/${dd}/${d.getFullYear()}`;
+      })();
+
+      // ── Is Liquid: always derived from Family Type ───────────────────────
+      const derivedIsLiquid = familyType === "Admixture & Fiber" ? "Yes" : "No";
 
       // Build output row in fixed OUTPUT_HEADERS order
       const out: any[] = new Array(OUTPUT_HEADERS.length).fill(null);
@@ -993,7 +1355,7 @@ export function convertAndMergeMaterials(
       out[COL.FAMILY_TYPE]      = familyType   || null;
       out[COL.MATERIAL_TYPE]    = materialType || null;
       out[COL.SPECIFIC_GRAVITY] = finalSG;
-      out[COL.IS_LIQUID]        = isLiquid     || null;
+      out[COL.IS_LIQUID]        = derivedIsLiquid;
       out[COL.WATER_CONTRIB]    = (waterContrib === "" || waterContrib === undefined) ? null : waterContrib;
       out[COL.COST]             = (cost         === "" || cost         === undefined) ? null : cost;
       out[COL.COST_UNITS]       = costUnits     || null;

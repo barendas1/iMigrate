@@ -23,9 +23,28 @@ import { useCallback, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import * as XLSX from "xlsx";
 import { saveAs } from "file-saver";
-import { convertAndMergeMaterials, revalidateMaterialWorkbook } from "../converters/materials/universal";
+import {
+  convertAndMergeMaterials,
+  revalidateMaterialWorkbook,
+  preAnalyzeMaterialFile,
+  MATERIAL_FIELD_LABELS,
+  CRITICAL_MATERIAL_FIELDS,
+  IMPORTANT_MATERIAL_FIELDS,
+} from "../converters/materials/universal";
 import { convertAndMergeMixes, buildMaterialsLookup } from "../converters/mixes/universal";
-import type { ValidationIssue } from "../converters/materials/universal";
+import type {
+  ValidationIssue,
+  ColumnMappingInfo,
+  MaterialFieldKey,
+} from "../converters/materials/universal";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Label } from "@/components/ui/label";
 
 interface ApprovedFile {
   workbook: XLSX.WorkBook;
@@ -54,6 +73,11 @@ export default function Home() {
   // Approved files queued for upload (persist across tab switches)
   const [approvedMaterials, setApprovedMaterials] = useState<ApprovedFile | null>(null);
   const [approvedMixes, setApprovedMixes] = useState<ApprovedFile | null>(null);
+
+  // Column-mapping prompt state (materials tab only)
+  const [mappingInfo, setMappingInfo] = useState<ColumnMappingInfo | null>(null);
+  const [userMappings, setUserMappings] = useState<Partial<Record<MaterialFieldKey, string>>>({});
+  const [pendingFileData, setPendingFileData] = useState<{ data: any[][]; fileName: string }[]>([]);
 
   // ── File drop ──────────────────────────────────────────────────────────────
   const onDrop = useCallback(
@@ -100,6 +124,9 @@ export default function Home() {
     setValidationIssues([]);
     setConversionStats(null);
     setError(null);
+    setMappingInfo(null);
+    setUserMappings({});
+    setPendingFileData([]);
   };
 
   const removeFile = (index: number) => {
@@ -162,6 +189,15 @@ export default function Home() {
         const filePayloads = await Promise.all(
           files.map(async (f) => ({ data: await fileToArray(f), fileName: f.name }))
         );
+        // Pre-analyze to detect unmapped columns before converting
+        const analysis = preAnalyzeMaterialFile(filePayloads[0].data);
+        if (analysis.unmappedCritical.length > 0 || analysis.unmappedImportant.length > 0) {
+          setPendingFileData(filePayloads);
+          setMappingInfo(analysis);
+          setUserMappings({});
+          setIsProcessing(false);
+          return;
+        }
         const result = convertAndMergeMaterials(filePayloads);
         processedRows = result.rows;
         issues = result.issues;
@@ -285,6 +321,45 @@ export default function Home() {
       setApprovedMixes(approved);
     }
     setActiveTab("mix-material");
+  };
+
+  // ── Column-mapping confirmation (materials tab, two-phase flow) ───────────
+  const handleConfirmMappingAndConvert = async () => {
+    if (pendingFileData.length === 0) return;
+    setIsProcessing(true);
+    setError(null);
+    setValidationIssues([]);
+    setConversionStats(null);
+
+    try {
+      // Strip the skip sentinel before passing overrides
+      const overrides: Partial<Record<MaterialFieldKey, string>> = {};
+      for (const [k, v] of Object.entries(userMappings)) {
+        if (v && v !== "__skip__") overrides[k as MaterialFieldKey] = v;
+      }
+
+      const result = convertAndMergeMaterials(pendingFileData, overrides);
+      const newWb = XLSX.utils.book_new();
+      const newWs = XLSX.utils.aoa_to_sheet(result.rows);
+      XLSX.utils.book_append_sheet(newWb, newWs, "Material Import");
+
+      setConvertedData(newWb);
+      setOriginalConvertedData(newWb);
+      setValidationIssues(result.issues);
+      setConversionStats({
+        totalInput: result.totalInputRows,
+        totalOutput: result.totalOutputRows,
+        skipped: result.skippedRows,
+      });
+      setSuccess(true);
+      setMappingInfo(null);
+      setPendingFileData([]);
+    } catch (err: any) {
+      console.error("Conversion error:", err);
+      setError(err.message || "Error processing file(s). Please check the file format.");
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   // ── Derived counts ─────────────────────────────────────────────────────────
@@ -432,6 +507,133 @@ export default function Home() {
           </li>
         ))}
       </ul>
+    </div>
+  ) : null;
+
+  // Column-mapping prompt shown when auto-detect misses required fields
+  const columnMappingJSX = mappingInfo ? (
+    <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-4 space-y-4">
+      <div className="flex items-start gap-3">
+        <AlertTriangle className="h-5 w-5 text-amber-600 mt-0.5 shrink-0" />
+        <div>
+          <p className="font-medium text-amber-800">Column Mapping Required</p>
+          <p className="text-sm text-amber-700 mt-1">
+            Some columns couldn't be automatically detected. Select which column
+            in your file corresponds to each field below, then click{" "}
+            <strong>Confirm & Convert</strong>.
+          </p>
+        </div>
+      </div>
+
+      {mappingInfo.unmappedCritical.length > 0 && (
+        <div className="space-y-3">
+          <p className="text-sm font-semibold text-destructive">
+            Required Fields — must be mapped to continue
+          </p>
+          {mappingInfo.unmappedCritical.map((field) => (
+            <div key={field} className="grid grid-cols-[1fr_1.5fr] gap-3 items-center">
+              <Label className="text-sm font-medium text-dark">
+                {MATERIAL_FIELD_LABELS[field]}
+                <span className="text-destructive ml-1">*</span>
+              </Label>
+              <Select
+                value={userMappings[field] ?? ""}
+                onValueChange={(val) =>
+                  setUserMappings((prev) => ({ ...prev, [field]: val }))
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select a column…" />
+                </SelectTrigger>
+                <SelectContent>
+                  {mappingInfo.fileHeaders.filter(Boolean).map((header) => (
+                    <SelectItem key={header} value={header}>
+                      {header}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {mappingInfo.unmappedImportant.length > 0 && (
+        <div className="space-y-3">
+          <p className="text-sm font-semibold text-yellow-700">
+            Optional Fields — map or skip
+          </p>
+          {mappingInfo.unmappedImportant.map((field) => (
+            <div key={field} className="grid grid-cols-[1fr_1.5fr] gap-3 items-center">
+              <Label className="text-sm font-medium text-dark">
+                {MATERIAL_FIELD_LABELS[field]}
+              </Label>
+              <Select
+                value={userMappings[field] ?? ""}
+                onValueChange={(val) =>
+                  setUserMappings((prev) => ({
+                    ...prev,
+                    [field]: val === "__skip__" ? "" : val,
+                  }))
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Skip (leave blank)" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__skip__">— Skip this field —</SelectItem>
+                  {mappingInfo.fileHeaders.filter(Boolean).map((header) => (
+                    <SelectItem key={header} value={header}>
+                      {header}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {Object.keys(mappingInfo.detectedMappings).length > 0 && (
+        <div className="text-xs text-muted-foreground border-t border-amber-200 pt-3">
+          <p className="font-medium mb-1.5">Auto-detected columns:</p>
+          <div className="flex flex-wrap gap-1.5">
+            {(Object.entries(mappingInfo.detectedMappings) as [MaterialFieldKey, string][]).map(
+              ([field, col]) => (
+                <span
+                  key={field}
+                  className="bg-white border border-border rounded px-2 py-0.5"
+                >
+                  {MATERIAL_FIELD_LABELS[field]} → <em>{col}</em>
+                </span>
+              )
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="flex items-center justify-end gap-3 pt-2 border-t border-amber-200">
+        <Button variant="outline" onClick={resetState}>
+          Cancel
+        </Button>
+        <Button
+          className="bg-primary hover:bg-primary-hover text-white"
+          disabled={
+            isProcessing ||
+            mappingInfo.unmappedCritical.some((f) => !userMappings[f])
+          }
+          onClick={handleConfirmMappingAndConvert}
+        >
+          {isProcessing ? (
+            <>
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              Converting…
+            </>
+          ) : (
+            "Confirm & Convert"
+          )}
+        </Button>
+      </div>
     </div>
   ) : null;
 
@@ -642,7 +844,7 @@ export default function Home() {
                   {/* Status banners, validation panel, and action buttons are OUTSIDE the dropzone */}
                   {statusBannerJSX}
                   {validationPanelJSX}
-                  {actionButtonsJSX}
+                  {mappingInfo && !success ? columnMappingJSX : actionButtonsJSX}
                 </CardContent>
               </Card>
 

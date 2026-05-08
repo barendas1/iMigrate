@@ -179,6 +179,9 @@ const ALIASES: Record<keyof typeof COL, string[]> = {
     "material", "mat name", "product name", "product", "description",
     "material description", "name", "item name", "item description",
     "mat description", "material trade name",
+    // Additional informal names
+    "mat. name", "matname", "prod name", "prod. name", "mix name",
+    "component name", "component", "chem name", "chemical name",
   ],
   DATE: [
     "material date (mm/dd/yyyy)", "material date", "date", "effective date",
@@ -198,6 +201,9 @@ const ALIASES: Record<keyof typeof COL, string[]> = {
     "specific gravity (required)", "specific gravity", "sg", "sp gr",
     "sp. gr.", "sp. gravity", "specific gr", "relative density",
     "density", "bulk density", "specific weight",
+    // Short / informal names often found in customer sheets
+    "gravity", "spec grav", "spec. grav", "spec. grav.", "sp grav",
+    "sp. grav", "sp. grav.", "s.g.", "s.g", "spg",
     // Raw dispatch export names
     "specificgravity", "spgravity", "sp_gravity", "spec_gravity",
     "relativedensity", "rd",
@@ -377,19 +383,28 @@ function findHeaderRowIndex(rows: any[][]): number {
   for (let i = 0; i < Math.min(6, rows.length); i++) {
     const row = rows[i];
     if (!row) continue;
+    // Require at least 2 non-empty cells — real header rows are never single-cell
+    const nonEmpty = row.filter((v) => String(v ?? "").trim().length > 0);
+    if (nonEmpty.length < 2) continue;
     const joined = row.map((v) => String(v ?? "").toLowerCase()).join("|");
     if (
       joined.includes("plant") ||
       joined.includes("trade name") ||
+      joined.includes("tradename") ||
       joined.includes("material type") ||
       joined.includes("material name") ||
       joined.includes("specific gravity") ||
       joined.includes("specificgravity") ||
+      joined.includes("gravity") ||          // short form
+      joined.includes("sp gr") ||            // short form
+      joined.includes("trade name") ||
+      joined.includes("item code") ||
+      joined.includes("item name") ||
+      joined.includes("product name") ||
       joined.includes("cementid") ||
       joined.includes("aggregateid") ||
       joined.includes("admixtureid") ||
-      joined.includes("extraid") ||
-      joined.includes("name")
+      joined.includes("extraid")
     ) {
       return i;
     }
@@ -398,10 +413,54 @@ function findHeaderRowIndex(rows: any[][]): number {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: build a resolved column index map for a given header row.
-// For each output field key, finds the first matching input column index.
+// Human-readable labels for each output field (used in mapping UI)
 // ---------------------------------------------------------------------------
-function resolveColumns(headerRow: any[]): Map<keyof typeof COL, number> {
+export const MATERIAL_FIELD_LABELS: Record<keyof typeof COL, string> = {
+  PLANT:            "Plant Code",
+  TRADE_NAME:       "Trade Name",
+  DATE:             "Material Date",
+  FAMILY_TYPE:      "Family Material Type",
+  MATERIAL_TYPE:    "Material Type",
+  SPECIFIC_GRAVITY: "Specific Gravity",
+  IS_LIQUID:        "Is Liquid Admixture",
+  WATER_CONTRIB:    "Water Contribution (%)",
+  COST:             "Cost",
+  COST_UNITS:       "Cost Units",
+  MANUFACTURER:     "Manufacturer",
+  MFR_SOURCE:       "Manufacturer Source",
+  BATCH_ORDER:      "Batching Order Number",
+  ITEM_CODE:        "Production Item Code",
+  ITEM_DESC:        "Production Item Description",
+  ITEM_SHORT_DESC:  "Production Item Short Description",
+  ITEM_CATEGORY:    "Production Item Category",
+  ITEM_CAT_DESC:    "Production Item Category Description",
+  ITEM_CAT_SHORT:   "Production Item Category Short Description",
+  BATCH_PANEL:      "Batch Panel Code",
+};
+
+export type MaterialFieldKey = keyof typeof COL;
+
+// Fields the user MUST map before conversion can succeed
+export const CRITICAL_MATERIAL_FIELDS: MaterialFieldKey[] = ["TRADE_NAME", "SPECIFIC_GRAVITY"];
+// Fields that produce warnings if blank but don't block conversion
+export const IMPORTANT_MATERIAL_FIELDS: MaterialFieldKey[] = ["PLANT", "FAMILY_TYPE", "MATERIAL_TYPE"];
+
+// Result of pre-analysing a file's column structure before conversion
+export interface ColumnMappingInfo {
+  fileHeaders: string[];                             // all non-empty headers found
+  detectedMappings: Partial<Record<MaterialFieldKey, string>>; // field → auto-detected header
+  unmappedCritical: MaterialFieldKey[];              // must be user-resolved
+  unmappedImportant: MaterialFieldKey[];             // warn user, but optional to resolve
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build a resolved column index map for a given header row.
+// userOverrides maps field keys to the exact column header name chosen by user.
+// ---------------------------------------------------------------------------
+function resolveColumns(
+  headerRow: any[],
+  userOverrides?: Partial<Record<MaterialFieldKey, string>>
+): Map<keyof typeof COL, number> {
   // Build a normalised lookup of input headers: normalised -> col index
   const inputMap = new Map<string, number>();
   headerRow.forEach((cell, idx) => {
@@ -413,7 +472,21 @@ function resolveColumns(headerRow: any[]): Map<keyof typeof COL, number> {
 
   const resolved = new Map<keyof typeof COL, number>();
 
+  // Apply user overrides first — they take precedence over alias matching
+  if (userOverrides) {
+    for (const [fieldKey, headerName] of Object.entries(userOverrides) as [MaterialFieldKey, string][]) {
+      if (headerName) {
+        const norm = headerName.trim().toLowerCase();
+        if (inputMap.has(norm)) {
+          resolved.set(fieldKey, inputMap.get(norm)!);
+        }
+      }
+    }
+  }
+
   for (const fieldKey of Object.keys(ALIASES) as Array<keyof typeof COL>) {
+    if (resolved.has(fieldKey)) continue; // already resolved by user override
+
     for (const alias of ALIASES[fieldKey]) {
       if (inputMap.has(alias)) {
         resolved.set(fieldKey, inputMap.get(alias)!);
@@ -422,7 +495,6 @@ function resolveColumns(headerRow: any[]): Map<keyof typeof COL, number> {
     }
     // If no exact alias matched, try partial / contains matching as fallback
     if (!resolved.has(fieldKey)) {
-      // Use the first alias as the "canonical" keyword to search for
       const keyword = ALIASES[fieldKey][0].toLowerCase();
       for (const [norm, idx] of Array.from(inputMap.entries())) {
         if (norm.includes(keyword) || keyword.includes(norm)) {
@@ -434,6 +506,32 @@ function resolveColumns(headerRow: any[]): Map<keyof typeof COL, number> {
   }
 
   return resolved;
+}
+
+// ---------------------------------------------------------------------------
+// Pre-analysis: inspect a file's headers and report what can/can't be mapped.
+// Call this before conversion to decide whether to prompt the user.
+// ---------------------------------------------------------------------------
+export function preAnalyzeMaterialFile(data: any[][]): ColumnMappingInfo {
+  const headerIdx = findHeaderRowIndex(data);
+  const headerRow = data[headerIdx] ?? [];
+
+  const fileHeaders = headerRow
+    .map((v) => String(v ?? "").trim())
+    .filter((h) => h.length > 0);
+
+  const resolved = resolveColumns(headerRow);
+
+  const detectedMappings: Partial<Record<MaterialFieldKey, string>> = {};
+  resolved.forEach((colIdx, fieldKey) => {
+    const header = String(headerRow[colIdx] ?? "").trim();
+    if (header) (detectedMappings as Record<string, string>)[fieldKey] = header;
+  });
+
+  const unmappedCritical  = CRITICAL_MATERIAL_FIELDS.filter((f) => !resolved.has(f));
+  const unmappedImportant = IMPORTANT_MATERIAL_FIELDS.filter((f) => !resolved.has(f));
+
+  return { fileHeaders, detectedMappings, unmappedCritical, unmappedImportant };
 }
 
 // ---------------------------------------------------------------------------
@@ -652,7 +750,8 @@ export function revalidateMaterialWorkbook(rows: any[][]): RevalidationResult {
 }
 
 export function convertAndMergeMaterials(
-  files: { data: any[][]; fileName: string }[]
+  files: { data: any[][]; fileName: string }[],
+  columnOverrides?: Partial<Record<MaterialFieldKey, string>>
 ): MaterialConversionResult {
   const allIssues: ValidationIssue[] = [];
   const allDataRows: any[][] = [];
@@ -671,7 +770,7 @@ export function convertAndMergeMaterials(
 
     const headerIdx = findHeaderRowIndex(data);
     const headerRow = data[headerIdx];
-    const colMap    = resolveColumns(headerRow);
+    const colMap    = resolveColumns(headerRow, columnOverrides);
 
     // Detect file type from column structure
     const fileType = inferFileType(headerRow);

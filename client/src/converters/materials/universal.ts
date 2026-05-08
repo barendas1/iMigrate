@@ -219,7 +219,7 @@ const ALIASES: Record<keyof typeof COL, string[]> = {
     "water contribution percent",
     // Raw dispatch export names
     "moisture", "moisture content", "moisture%", "freemoisture",
-    "absorption", "freewater",
+    // NOTE: "absorption" and "freewater" are aggregate properties, NOT water contribution — omitted intentionally
   ],
   COST: [
     "cost", "unit cost", "price", "unit price", "material cost",
@@ -248,6 +248,8 @@ const ALIASES: Record<keyof typeof COL, string[]> = {
     "product code", "material code", "mat code", "code", "sku",
     "item number", "item no", "item #", "material number", "mat number",
     "material id", "mat id", "part number", "part no",
+    // Column headers with "(Required for import)" suffix (e.g. Wingra format)
+    "id (required for import)", "component id", "item id",
     // Raw dispatch export IDs
     "cementid", "aggregateid", "admixtureid", "extraid", "externalid",
     "materialid", "mat_id", "prodid", "productid",
@@ -485,11 +487,28 @@ function normalizeMaterialType(raw: string, familyType?: string): string | null 
   const v = raw.trim();
   if (!v) return null;
 
-  // Step 1: exact match (case-insensitive)
-  const exact = MATERIAL_TYPE_EXACT.get(v.toLowerCase());
-  if (exact) return exact;
-
   const vl = v.toLowerCase();
+
+  // Material types that belong exclusively to the Cement family — if the resolved
+  // family type is NOT Cement we should not blindly accept one of these.
+  const CEMENT_ONLY = new Set([
+    "cement","type i","type ii","type iii","type i-ii","type ii-v","type iv","type v",
+    "type gu","type il","type ip","type ip (ms)","type is","type p","type i(pm)","type i(sm)",
+    "expansive type k","expansive type m","expansive type s","sspwc expansive cement",
+    "rapid set","cement blends","fixed cement blends","variable cement blends",
+    "bs en 197-1 (cem i)","32.5 n","32.5 r","42.5 n","42.5 r","52.5 n","52.5 r",
+  ]);
+
+  // Step 1: exact match (case-insensitive), but skip Cement-only types when
+  // the target family is clearly NOT Cement (avoids SLAG → "Cement" via exact match)
+  const exact = MATERIAL_TYPE_EXACT.get(vl);
+  if (exact) {
+    if (familyType && familyType !== "Cement" && CEMENT_ONLY.has(vl)) {
+      // Fall through to family-scoped fuzzy matching below
+    } else {
+      return exact;
+    }
+  }
 
   // Step 2: common shorthand/abbreviation lookup
   const abbrevMap: Record<string, string> = {
@@ -747,6 +766,13 @@ export interface ColumnMappingInfo {
   unmappedImportant: MaterialFieldKey[];             // warn user, but optional to resolve
 }
 
+// Words too common/short to safely use in the alias.includes(norm) direction.
+// These appear as suffix words in many aliases and cause false positives when
+// a column is named just "name", "id", "type", etc.
+const REVERSE_MATCH_BLACKLIST = new Set([
+  "name", "id", "no", "type", "date", "unit", "number", "value", "data",
+]);
+
 // ---------------------------------------------------------------------------
 // Helper: build a resolved column index map for a given header row.
 // userOverrides maps field keys to the exact column header name chosen by user.
@@ -805,10 +831,12 @@ function resolveColumns(
         for (const alias of ALIASES[fieldKey]) {
           // norm.includes(alias): header contains alias as substring
           // alias.includes(norm): alias contains abbreviated header —
-          //   require norm.length >= 4 so "id" never matches "plant id" etc.
+          //   blocked for blacklisted generic words ("name", "id", etc.) and
+          //   short norms (< 4 chars) to prevent "name" matching "manufacturer name"
           if (alias.length >= 3 && (
             norm.includes(alias) ||
-            (norm.length >= 4 && alias.length >= norm.length && alias.includes(norm))
+            (norm.length >= 4 && !REVERSE_MATCH_BLACKLIST.has(norm) &&
+             alias.length >= norm.length && alias.includes(norm))
           )) {
             resolved.set(fieldKey, idx);
             break outer;
@@ -1062,6 +1090,71 @@ export function revalidateMaterialWorkbook(rows: any[][]): RevalidationResult {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Collapses repeated per-row warnings into single summary lines.
+// Errors are left untouched (they're critical and row-specific).
+// ---------------------------------------------------------------------------
+function consolidateIssues(issues: ValidationIssue[]): ValidationIssue[] {
+  const errors = issues.filter((i) => i.type === "error");
+  const warnings = issues.filter((i) => i.type === "warning");
+
+  type Group = {
+    first: ValidationIssue;
+    template: string;
+    field: string | undefined;
+    names: string[];
+    count: number;
+  };
+
+  const groups = new Map<string, Group>();
+
+  for (const w of warnings) {
+    // Strip "[filename] Row N ('trade name'): " prefix to get a category template
+    const withoutPrefix = w.message
+      .replace(/^\[.*?\]\s*/, "")
+      .replace(/^Row \d+\s*\('[^']*'\)\s*:\s*/, "")
+      .replace(/^Row \d+\s*:\s*/, "");
+
+    // Collapse specific quoted values so variant messages group together
+    const template = withoutPrefix.replace(/'[^']*'/g, "'…'");
+    const key = `${w.field ?? ""}||${template}`;
+
+    const group = groups.get(key);
+    if (!group) {
+      const nameMatch = w.message.match(/Row \d+\s*\('([^']+)'\)/);
+      groups.set(key, {
+        first: w,
+        template: withoutPrefix,
+        field: w.field,
+        names: nameMatch ? [nameMatch[1]] : [],
+        count: 1,
+      });
+    } else {
+      group.count++;
+      const nameMatch = w.message.match(/Row \d+\s*\('([^']+)'\)/);
+      if (nameMatch && group.names.length < 4) group.names.push(nameMatch[1]);
+    }
+  }
+
+  const consolidated: ValidationIssue[] = [];
+  groups.forEach((g) => {
+    if (g.count === 1) {
+      consolidated.push(g.first);
+    } else {
+      const nameList = g.names.length
+        ? ` (e.g. ${g.names.map((n) => `'${n}'`).join(", ")}${g.count > g.names.length ? `, +${g.count - g.names.length} more` : ""})`
+        : "";
+      consolidated.push({
+        type: "warning",
+        message: `${g.count} rows: ${g.template}${nameList}`,
+        field: g.field,
+      });
+    }
+  });
+
+  return [...errors, ...consolidated];
+}
+
 export function convertAndMergeMaterials(
   files: { data: any[][]; fileName: string }[],
   columnOverrides?: Partial<Record<MaterialFieldKey, string>>
@@ -1161,10 +1254,23 @@ export function convertAndMergeMaterials(
       const batchPanel   = String(pick(raw, colMap, "BATCH_PANEL")       ?? "").trim();
 
       // ── Family Type normalization ───────────────────────────────────────
+      // Track whether the source file had an explicit family type column.
+      // When it didn't, the trade name is a stronger signal than the file's
+      // (possibly misclassified) material type (e.g. SLAG filed as CEMENT).
+      const rawFamilyFromFile = String(pick(raw, colMap, "FAMILY_TYPE") ?? "").trim();
+
       // Step 1: if family type is missing, try to derive from material type name
       if (!familyType && materialType) {
         const derived = normalizeFamilyType(materialType);
         if (derived) familyType = derived;
+      }
+      // Step 1b: if there was no family type column in the file, also try trade
+      // name as a signal — it often reveals the true family (e.g. "SLAG" → Mineral)
+      if (!rawFamilyFromFile) {
+        const derivedFromName = normalizeFamilyType(tradeName);
+        if (derivedFromName && derivedFromName !== familyType) {
+          familyType = derivedFromName;
+        }
       }
       // Step 2: if family type exists but isn't a valid value, try to map it
       if (familyType && !VALID_FAMILY_TYPES.has(familyType.toLowerCase())) {
@@ -1443,7 +1549,7 @@ export function convertAndMergeMaterials(
 
   return {
     rows: [OUTPUT_HEADERS, ...cleanedRows],
-    issues: allIssues,
+    issues: consolidateIssues(allIssues),
     totalInputRows,
     totalOutputRows: cleanedRows.length,
     skippedRows: totalSkipped,

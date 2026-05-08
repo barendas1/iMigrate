@@ -404,7 +404,8 @@ function findHeaderRowIndex(rows: any[][]): number {
       joined.includes("cementid") ||
       joined.includes("aggregateid") ||
       joined.includes("admixtureid") ||
-      joined.includes("extraid")
+      joined.includes("extraid") ||
+      joined.includes("required for import")  // Wingra / similar export format
     ) {
       return i;
     }
@@ -461,12 +462,21 @@ function resolveColumns(
   headerRow: any[],
   userOverrides?: Partial<Record<MaterialFieldKey, string>>
 ): Map<keyof typeof COL, number> {
-  // Build a normalised lookup of input headers: normalised -> col index
+  // Build a normalised lookup of input headers: normalised -> col index.
+  // Also add a "stripped" key for headers that carry verbose suffixes like
+  // "(Required for import)" or "(Required)" so they match plain aliases.
   const inputMap = new Map<string, number>();
   headerRow.forEach((cell, idx) => {
     const norm = String(cell ?? "").trim().toLowerCase();
-    if (norm && !inputMap.has(norm)) {
-      inputMap.set(norm, idx);
+    if (!norm) return;
+    if (!inputMap.has(norm)) inputMap.set(norm, idx);
+    // Strip common annotation suffixes so "Name (Required for import)" → "name"
+    const stripped = norm
+      .replace(/\s*\(required(?:\s+for\s+import)?\)\s*$/i, "")
+      .replace(/\s*\(required\)\s*$/i, "")
+      .trim();
+    if (stripped && stripped !== norm && !inputMap.has(stripped)) {
+      inputMap.set(stripped, idx);
     }
   });
 
@@ -487,19 +497,24 @@ function resolveColumns(
   for (const fieldKey of Object.keys(ALIASES) as Array<keyof typeof COL>) {
     if (resolved.has(fieldKey)) continue; // already resolved by user override
 
+    // Phase 1: exact alias match
     for (const alias of ALIASES[fieldKey]) {
       if (inputMap.has(alias)) {
         resolved.set(fieldKey, inputMap.get(alias)!);
         break;
       }
     }
-    // If no exact alias matched, try partial / contains matching as fallback
+
+    // Phase 2: partial / contains matching — try every alias, not just the first
     if (!resolved.has(fieldKey)) {
-      const keyword = ALIASES[fieldKey][0].toLowerCase();
+      outer:
       for (const [norm, idx] of Array.from(inputMap.entries())) {
-        if (norm.includes(keyword) || keyword.includes(norm)) {
-          resolved.set(fieldKey, idx);
-          break;
+        for (const alias of ALIASES[fieldKey]) {
+          // Require alias length >= 3 to avoid false positives on short strings
+          if (alias.length >= 3 && (norm.includes(alias) || (alias.length >= norm.length && alias.includes(norm)))) {
+            resolved.set(fieldKey, idx);
+            break outer;
+          }
         }
       }
     }

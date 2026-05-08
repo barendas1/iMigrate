@@ -161,10 +161,7 @@ export default function Home() {
         /mix|material|data/i.test(name)
       );
       if (!sheetName) {
-        sheetName =
-          workbook.SheetNames.length > 1
-            ? workbook.SheetNames[1]
-            : workbook.SheetNames[0];
+        sheetName = workbook.SheetNames[0];
       }
       const worksheet = workbook.Sheets[sheetName];
       return XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as any[][];

@@ -78,6 +78,11 @@ export default function Home() {
   const [mappingInfo, setMappingInfo] = useState<ColumnMappingInfo | null>(null);
   const [userMappings, setUserMappings] = useState<Partial<Record<MaterialFieldKey, string>>>({});
   const [pendingFileData, setPendingFileData] = useState<{ data: any[][]; fileName: string }[]>([]);
+  // Which worksheet was actually read from a multi-sheet workbook — shown so
+  // the user isn't stuck guessing why a mapping came out empty/wrong when the
+  // wrong sheet was silently auto-selected (e.g. a relational export with a
+  // master sheet + a separate per-plant junction sheet).
+  const [sheetHint, setSheetHint] = useState<string | null>(null);
 
   // ── File drop ──────────────────────────────────────────────────────────────
   const onDrop = useCallback(
@@ -127,6 +132,7 @@ export default function Home() {
     setMappingInfo(null);
     setUserMappings({});
     setPendingFileData([]);
+    setSheetHint(null);
   };
 
   const removeFile = (index: number) => {
@@ -136,6 +142,7 @@ export default function Home() {
     setShowInlinePreview(false);
     setValidationIssues([]);
     setConversionStats(null);
+    setSheetHint(null);
   };
 
   // ── File reader helpers ────────────────────────────────────────────────────
@@ -168,6 +175,22 @@ export default function Home() {
     }
   };
 
+  // Multi-sheet workbooks are silently reduced to a single guessed sheet by
+  // fileToArray above. That's invisible to the user — if the guess is wrong
+  // (e.g. a relational export split across a master sheet and a separate
+  // per-plant junction sheet), they'd otherwise just see a broken/empty
+  // result with no clue why. Surface which sheet was actually used so
+  // there's always an explanation instead of a silent dead end.
+  const describeSheetSelection = async (file: File): Promise<string | null> => {
+    if (file.name.toLowerCase().endsWith(".csv")) return null;
+    const arrayBuffer = await readFileAsArrayBuffer(file);
+    const workbook = XLSX.read(arrayBuffer, { type: "array" });
+    if (workbook.SheetNames.length <= 1) return null;
+    let sheetName = workbook.SheetNames.find((name) => /mix|material|data/i.test(name));
+    if (!sheetName) sheetName = workbook.SheetNames[0];
+    return `"${file.name}" has ${workbook.SheetNames.length} sheets (${workbook.SheetNames.join(", ")}) — only "${sheetName}" was read. If the data you need is on a different sheet (or split across sheets), upload the relevant sheet as its own file.`;
+  };
+
   // ── Conversion ─────────────────────────────────────────────────────────────
   const handleConvert = async () => {
     if (files.length === 0) return;
@@ -186,6 +209,10 @@ export default function Home() {
         const filePayloads = await Promise.all(
           files.map(async (f) => ({ data: await fileToArray(f), fileName: f.name }))
         );
+
+        const hint = await describeSheetSelection(files[0]);
+        setSheetHint(hint);
+
         // Pre-analyze to detect unmapped columns before converting
         const analysis = preAnalyzeMaterialFile(filePayloads[0].data);
         if (analysis.unmappedCritical.length > 0 || analysis.unmappedImportant.length > 0) {
@@ -203,6 +230,19 @@ export default function Home() {
           totalOutput: result.totalOutputRows,
           skipped: result.skippedRows,
         };
+
+        // Never report "success" on an empty result — that's a dead end
+        // dressed up as a win. Explain what likely happened instead.
+        if (stats.totalOutput === 0) {
+          setValidationIssues(issues);
+          setError(
+            `No rows could be converted — every row was skipped or the file had no usable data. ${
+              hint ? hint + " " : ""
+            }See the validation details below for why each row was skipped, and confirm the correct sheet/file was uploaded.`
+          );
+          setIsProcessing(false);
+          return;
+        }
       } else if (activeTab === "mixes") {
         let mixFiles = files;
         let materialsLookup = new Map<string, string>();
@@ -336,6 +376,23 @@ export default function Home() {
       }
 
       const result = convertAndMergeMaterials(pendingFileData, overrides);
+
+      if (result.totalOutputRows === 0) {
+        setValidationIssues(result.issues);
+        setConversionStats({
+          totalInput: result.totalInputRows,
+          totalOutput: result.totalOutputRows,
+          skipped: result.skippedRows,
+        });
+        setError(
+          `No rows could be converted even with those column mappings — every row was skipped. ${
+            sheetHint ? sheetHint + " " : ""
+          }See the validation details below for why, then adjust the mapping above and try again.`
+        );
+        setIsProcessing(false);
+        return;
+      }
+
       const newWb = XLSX.utils.book_new();
       const newWs = XLSX.utils.aoa_to_sheet(result.rows);
       XLSX.utils.book_append_sheet(newWb, newWs, "Material Import");
@@ -519,6 +576,9 @@ export default function Home() {
             in your file corresponds to each field below, then click{" "}
             <strong>Confirm & Convert</strong>.
           </p>
+          {sheetHint && (
+            <p className="text-sm text-amber-700 mt-2 italic">{sheetHint}</p>
+          )}
         </div>
       </div>
 

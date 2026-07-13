@@ -35,6 +35,13 @@ interface FileAnalysis {
     cements: { id: string; target: string }[];
     admixtures: { id: string; target: string }[];
   };
+  // Present when the file is long-format (one row PER CONSTITUENT, mix info
+  // repeated across rows) rather than the wide Agg1../Cem1../Adm1.. layout.
+  dataShape?: "wide" | "long";
+  constituentIdColumn?: string | null;
+  constituentNameColumn?: string | null;
+  quantityColumn?: string | null;
+  unitColumn?: string | null;
 }
 
 interface AnalysisResult {
@@ -70,17 +77,36 @@ Max Slump (mm), Max Batch Size, Max Water Liters, Max W/C+P, Max W/C,
 "Mix Class Names, separate with semicolon", Mix Usage, Dispatch Slump Range, Dispatch,
 Constituent Item Code, Constituent Item Description, Quantity, Unit Name
 
+SOURCE FILES COME IN TWO POSSIBLE SHAPES — figure out which one you're looking at:
+
+1. WIDE format: one row PER MIX, with constituents in repeated slot columns
+   like Agg1Id/Agg1Target, Agg2Id/Agg2Target, ..., Cem1Id/Cem1Target, ...,
+   Adm1Id/Adm1Target, ... (typical of MPAQ-style plant-control exports).
+
+2. LONG format: one row PER CONSTITUENT — the mix ID/name, and often the
+   plant/location, repeat across many rows, and each row carries a single
+   constituent's ID, name, quantity, and unit of measure directly (typical
+   of relational/junction-table exports, e.g. a "mix component" or
+   "custom-location-design" table joined to a mix header table). A single
+   row's plant/location field may itself list MULTIPLE plant codes
+   separated by commas (e.g. "01, 02, 05") meaning the row applies to all
+   of them — note this but do not try to resolve it yourself, the app
+   explodes it automatically.
+
+Set "dataShape" to "wide" or "long" based on which pattern the headers and
+sample rows actually match. Do not force wide-format field names onto a file
+that is clearly long-format, and vice versa.
+
 CRITICAL MAPPING RULES:
-- Each mix creates MULTIPLE rows — one row per constituent material (Agg, Cem, Adm)
-- Mix header columns (Plant Code through Dispatch) repeat on EVERY constituent row
-- Aggregate and Cement → unit "kg"; Admixture → unit "ml/ckg CM"
-- Mix Name AND Description BOTH come from the full descriptive name column (e.g. "Name", "Description") — NOT from the short code/ID column
+- WIDE: each mix creates MULTIPLE output rows — one row per constituent material (Agg, Cem, Adm). Mix header columns (Plant Code through Dispatch) repeat on every constituent row. Aggregate and Cement → unit "kg"; Admixture → unit "ml/ckg CM".
+- LONG: each source row already IS one constituent — map constituentIdColumn/constituentNameColumn/quantityColumn/unitColumn directly; do not invent Agg/Cem/Adm slot columns that don't exist in the file.
+- Mix Name AND Description BOTH come from the full descriptive name column (e.g. "Name", "Description", "Mix Design Name") — NOT from the short code/ID column
 - Constituent Item Description is always LEFT EMPTY in the output
-- Strength (MPA) is extracted from the mix name (e.g., "20 MPa 10mm N" → 20)
+- Strength (MPA) is extracted from the mix name (e.g., "20 MPa 10mm N" → 20; a US file with "3000 PSI" is converted automatically downstream — just confirm extractStrengthFromName)
 - Min/Max Slump extracted from aggregate size pattern in name (e.g., "10/14mm" → Min=10 Max=14)
 - All other output columns (Short Description, Item Category, Strength Age, Design Air Content, Design Slump, Max Water, etc.) are left EMPTY
 - Constituents with non-empty material IDs ARE included in output even when target quantity is 0
-- Only mixes where WaterTarget > 0 should be converted (skip zero-water mixes)
+- If a water-target-style column exists, only mixes where it's > 0 should be converted (skip zero-water mixes); if no such column exists in a long-format file, don't invent one
 
 Return ONLY valid JSON (no markdown) with this exact structure:
 {
@@ -89,6 +115,7 @@ Return ONLY valid JSON (no markdown) with this exact structure:
     {
       "fileName": "...",
       "headers": ["col1", "col2", "..."],
+      "dataShape": "wide" or "long",
       "plantColumn": "column name or null",
       "mixIdColumn": "short mix code/identifier column or null",
       "mixNameColumn": "full descriptive name column (used for both Mix Name and Description output)",
@@ -97,7 +124,11 @@ Return ONLY valid JSON (no markdown) with this exact structure:
         "aggregates": [{"id": "Agg1ID", "target": "Agg1Target"}, ...],
         "cements": [{"id": "Cem1ID", "target": "Cem1Target"}, ...],
         "admixtures": [{"id": "Adm1ID", "target": "Adm1Target"}, ...]
-      }
+      },
+      "constituentIdColumn": "column with the constituent material ID (long format only) or null",
+      "constituentNameColumn": "column with the constituent material name (long format only) or null",
+      "quantityColumn": "column with the constituent quantity (long format only) or null",
+      "unitColumn": "column with the unit of measure for that quantity (long format only) or null"
     }
   ],
   "questions": [
@@ -115,15 +146,119 @@ Return ONLY valid JSON (no markdown) with this exact structure:
 Only ask 2-4 questions about genuinely ambiguous cases. Avoid asking about things that are clear from the data.
 Common questions to consider (only ask if truly ambiguous):
 - plant_format: ONLY ask if plant values are numeric AND you cannot determine whether zero-padding is intended. Default: "As-is (no padding)"
-- extract_strength: ask if mix names appear to contain MPa strength values. Default: "Yes - extract from name"
+- extract_strength: ask if mix names appear to contain MPa/PSI strength values. Default: "Yes - extract from name"
 - extract_slump_range: ask if mix names contain size patterns like "10mm" or "10/14mm". Default: "Yes - extract min/max from name"
 - adm_unit: ONLY ask if admixture unit is genuinely ambiguous. Default: "ml/ckg CM"
 
 Do NOT ask about:
 - Whether to include zero-quantity constituents (always include non-empty-ID rows)
-- Whether to skip zero-water mixes (always skip)
+- Whether to skip zero-water mixes (always skip, only when a water-target column actually exists)
 - Constituent Item Description (always empty)
-- Short Description, Item Category, Strength Age, Air Content, Design Slump, Max Water (always empty)`;
+- Short Description, Item Category, Strength Age, Air Content, Design Slump, Max Water (always empty)
+
+IMPORTANT — NEVER LEAVE THE USER STUCK:
+If you cannot confidently identify the required structure for EITHER format
+(no mixIdColumn, or no usable constituent columns in either shape), do NOT
+just describe the limitation in "analysis" and stop there — that leaves the
+user with no way to proceed. Instead, ask 1-3 questions of type "text" that
+directly ask the user to name the exact column(s) you couldn't determine
+(e.g. "Which column contains the constituent material ID/code for each
+row?"), with your best guess pre-filled as the "default" so the user only
+has to confirm or correct it, not start from a blank field.`;
+
+// ── Deterministic safety net ────────────────────────────────────────────────
+// The AI is instructed to always ask clarifying questions when it can't map
+// a file, but LLM output can't be trusted 100% of the time (it might still
+// return an "analysis" sentence with no usable columns and no questions).
+// This client-side check runs regardless of what the AI actually did, so the
+// user is NEVER left with a dead-end "Convert" button that's guaranteed to
+// fail — if the structure genuinely can't be determined, we always inject
+// manual-mapping questions ourselves.
+
+function guessHeader(headers: string[], keywords: string[]): string {
+  const lower = headers.map((h) => h.toLowerCase());
+  for (const kw of keywords) {
+    const idx = lower.findIndex((h) => h === kw);
+    if (idx !== -1) return headers[idx];
+  }
+  for (const kw of keywords) {
+    const idx = lower.findIndex((h) => h.includes(kw));
+    if (idx !== -1) return headers[idx];
+  }
+  return "";
+}
+
+function hasWideStructure(a: FileAnalysis | undefined): boolean {
+  if (!a) return false;
+  const cc = a.constituentColumns;
+  const wideCount =
+    (cc?.aggregates?.length ?? 0) + (cc?.cements?.length ?? 0) + (cc?.admixtures?.length ?? 0);
+  return !!a.mixIdColumn && wideCount > 0;
+}
+
+function hasLongStructure(a: FileAnalysis | undefined): boolean {
+  if (!a) return false;
+  return a.dataShape === "long" && !!a.mixIdColumn && !!a.constituentIdColumn && !!a.quantityColumn;
+}
+
+function needsManualMapping(a: FileAnalysis | undefined): boolean {
+  return !hasWideStructure(a) && !hasLongStructure(a);
+}
+
+// Builds a guaranteed-actionable set of manual mapping questions from the raw
+// file headers alone (no AI needed), pre-filled with best guesses so the user
+// mostly just confirms rather than typing column names from scratch.
+function buildManualMappingQuestions(headers: string[]): AIQuestion[] {
+  return [
+    {
+      id: "manual_data_shape",
+      question: "How is each row in this file structured?",
+      type: "select",
+      options: [
+        "One row per constituent (mix info repeats across multiple rows)",
+        "One row per mix (constituents are in separate Agg/Cem/Adm columns)",
+      ],
+      default: "One row per constituent (mix info repeats across multiple rows)",
+      context: "We couldn't determine this automatically — pick whichever matches your file.",
+    },
+    {
+      id: "manual_mix_id_column",
+      question: "Which column identifies the mix design (a code or ID shared by every row of that mix)?",
+      type: "text",
+      default: guessHeader(headers, ["mix design id", "mix id", "mixid", "mix code", "id"]),
+    },
+    {
+      id: "manual_mix_name_column",
+      question: "Which column has the full mix name/description?",
+      type: "text",
+      default: guessHeader(headers, ["mix design name", "mix name", "description", "name"]),
+    },
+    {
+      id: "manual_plant_column",
+      question: "Which column has the plant/location code? (If a row can list multiple plants separated by commas, that's fine — it'll be split automatically.)",
+      type: "text",
+      default: guessHeader(headers, ["location id", "plant code", "plant id", "plant", "location"]),
+    },
+    {
+      id: "manual_constituent_id_column",
+      question: "Only if one row = one constituent: which column has the constituent material ID/code?",
+      type: "text",
+      default: guessHeader(headers, ["mix component id", "component id", "material id", "constituent id", "item code"]),
+    },
+    {
+      id: "manual_quantity_column",
+      question: "Only if one row = one constituent: which column has the quantity for that constituent?",
+      type: "text",
+      default: guessHeader(headers, ["quantity", "target", "amount"]),
+    },
+    {
+      id: "manual_unit_column",
+      question: "Only if one row = one constituent: which column has the unit of measure for that quantity?",
+      type: "text",
+      default: guessHeader(headers, ["unit of measure", "uom", "unit"]),
+    },
+  ];
+}
 
 // ── Component ────────────────────────────────────────────────────────────────
 
@@ -172,42 +307,81 @@ export function AIMixConversionPanel({
     setAiError(null);
     setStatusMessage("Reading files...");
 
+    let filePayloads: { data: any[][]; fileName: string }[];
     try {
-      const filePayloads = await Promise.all(
+      filePayloads = await Promise.all(
         files.map(async (f) => ({ data: await fileToArray(f), fileName: f.name }))
       );
       setFileDataCache(filePayloads);
+    } catch (err: any) {
+      // Genuinely can't proceed \u2014 the file itself couldn't be read.
+      setPhase("idle");
+      setAiError(err.message || "Failed to read the uploaded file(s).");
+      return;
+    }
 
-      setStatusMessage("Analyzing column structure with AI...");
+    setStatusMessage("Analyzing column structure with AI...");
 
-      const fileSummaries = filePayloads.map(({ data, fileName }) => {
-        const headers = (data[0] || []).map((h) => String(h).replace(/^\uFEFF/, "").trim());
-        const sampleRows = data.slice(1, 4);
-        return { fileName, headers, sampleRows };
-      });
+    const fileSummaries = filePayloads.map(({ data, fileName }) => {
+      const headers = (data[0] || []).map((h) => String(h).replace(/^\uFEFF/, "").trim());
+      const sampleRows = data.slice(1, 4);
+      return { fileName, headers, sampleRows };
+    });
 
-      const analysis: AnalysisResult = await callOpenAI([
+    let analysis: AnalysisResult | null = null;
+    let analyzeError: string | null = null;
+    try {
+      analysis = await callOpenAI([
         { role: "system", content: ANALYSIS_SYSTEM_PROMPT },
         {
           role: "user",
           content: `Analyze these concrete mix files:\n${JSON.stringify(fileSummaries, null, 2)}`,
         },
       ]);
-
-      // Initialize answers with AI-suggested defaults
-      const defaultAnswers: Record<string, string> = {};
-      for (const q of analysis.questions || []) {
-        defaultAnswers[q.id] = q.default || (q.options?.[0] ?? "");
-      }
-
-      setAnalysisResult(analysis);
-      setAnswers(defaultAnswers);
-      setStatusMessage("");
-      setPhase("questioning");
     } catch (err: any) {
-      setPhase("idle");
-      setAiError(err.message || "Failed to analyze files");
+      analyzeError = err.message || "AI analysis failed.";
     }
+
+    // Never dead-end: whether the AI call failed outright, or it returned but
+    // couldn't confidently identify the file's structure, fall back to a
+    // deterministic manual-mapping question set built from the raw headers \u2014
+    // the user always has a way to proceed without needing the AI to succeed.
+    const primaryHeaders = fileSummaries[0]?.headers ?? [];
+    const primaryAnalysis = analysis?.fileAnalyses?.[0];
+    const stuck = !analysis || needsManualMapping(primaryAnalysis);
+
+    if (!analysis) {
+      analysis = {
+        analysis:
+          "AI analysis couldn't run, so we've prepared manual mapping questions instead \u2014 please fill these in from your file's columns.",
+        fileAnalyses: [],
+        questions: [],
+      };
+    } else if (stuck) {
+      analysis = {
+        ...analysis,
+        analysis:
+          (analysis.analysis ? analysis.analysis + " " : "") +
+          "We couldn't fully determine this file's structure automatically \u2014 please confirm the columns below.",
+      };
+    }
+
+    if (stuck) {
+      analysis.questions = [...(analysis.questions || []), ...buildManualMappingQuestions(primaryHeaders)];
+    }
+
+    // Initialize answers with AI-suggested (or manual-fallback) defaults
+    const defaultAnswers: Record<string, string> = {};
+    for (const q of analysis.questions || []) {
+      defaultAnswers[q.id] = q.default || (q.options?.[0] ?? "");
+    }
+
+    setAnalysisResult(analysis);
+    setAnswers(defaultAnswers);
+    setStatusMessage("");
+    // Surface the AI failure as a non-blocking note \u2014 manual questions above still let them proceed.
+    setAiError(analyzeError);
+    setPhase("questioning");
   };
 
   const handleConvert = async () => {
@@ -218,6 +392,13 @@ export function AIMixConversionPanel({
 
     try {
       const plan = buildPlanFromAnalysis(analysisResult, answers);
+
+      const problem = planLooksConvertible(plan);
+      if (problem) {
+        setPhase("questioning");
+        setAiError(problem);
+        return;
+      }
 
       setStatusMessage("Converting mixes...");
       const result: MixConversionResult = convertMixesWithPlan(fileDataCache, plan);
@@ -405,6 +586,36 @@ function buildPlanFromAnalysis(
   const ans = (id: string) => answers[id] ?? "";
   const isNo = (id: string) =>
     ans(id).toLowerCase().startsWith("no") || ans(id) === "false";
+  const trimmedOrNull = (v: string) => (v && v.trim() ? v.trim() : null);
+
+  // Manual mapping answers (present when the deterministic fallback questions
+  // were shown, see buildManualMappingQuestions) always win — they're the
+  // user's explicit confirmation/correction, not a guess.
+  const hasManualAnswers = ans("manual_data_shape") !== "";
+
+  const dataShape: "wide" | "long" | undefined = hasManualAnswers
+    ? (ans("manual_data_shape").toLowerCase().startsWith("one row per mix") ? "wide" : "long")
+    : primary.dataShape;
+
+  const plantColumn = hasManualAnswers
+    ? trimmedOrNull(ans("manual_plant_column"))
+    : primary.plantColumn ?? null;
+  const mixIdColumn = hasManualAnswers
+    ? trimmedOrNull(ans("manual_mix_id_column"))
+    : primary.mixIdColumn ?? null;
+  const mixNameColumn = hasManualAnswers
+    ? trimmedOrNull(ans("manual_mix_name_column"))
+    : primary.mixNameColumn ?? null;
+  const constituentIdColumn = hasManualAnswers
+    ? trimmedOrNull(ans("manual_constituent_id_column"))
+    : primary.constituentIdColumn ?? null;
+  const constituentNameColumn = hasManualAnswers ? null : primary.constituentNameColumn ?? null;
+  const quantityColumn = hasManualAnswers
+    ? trimmedOrNull(ans("manual_quantity_column"))
+    : primary.quantityColumn ?? null;
+  const unitColumn = hasManualAnswers
+    ? trimmedOrNull(ans("manual_unit_column"))
+    : primary.unitColumn ?? null;
 
   // Plant zero-padding: only if the user explicitly chose a padded option
   const padPlant =
@@ -422,15 +633,21 @@ function buildPlanFromAnalysis(
   const admUnit = admUnitAns && admUnitAns !== "" ? admUnitAns : "ml/ckg CM";
 
   return {
-    plantColumn: primary.plantColumn ?? null,
-    mixIdColumn: primary.mixIdColumn ?? null,
+    plantColumn,
+    mixIdColumn,
     // mixNameColumn drives both Mix Name and Description in the output
-    mixNameColumn: primary.mixNameColumn ?? null,
+    mixNameColumn,
     // These columns are detected but not used in output (fields are always empty)
     externalIdColumn: null,
     airFactorColumn: null,
     slumpColumn: null,
     waterTargetColumn: primary.waterTargetColumn ?? null,
+
+    dataShape,
+    constituentIdColumn,
+    constituentNameColumn,
+    quantityColumn,
+    unitColumn,
 
     padPlantToTwoDigits: padPlant,
     extractStrengthFromName: extractStrength,
@@ -445,4 +662,21 @@ function buildPlanFromAnalysis(
     cemUnit: "kg",
     strengthAgeDefault: 28,
   };
+}
+
+/**
+ * Preflight check before running the actual conversion. Returns a
+ * user-actionable message if the plan is missing something essential, or
+ * null if it's safe to proceed. This turns a would-be thrown error deep in
+ * the converter into a clear "here's what to fix" message that keeps the
+ * user in the questioning phase instead of dead-ending on a generic failure.
+ */
+function planLooksConvertible(plan: MixConversionPlan): string | null {
+  if (!plan.mixIdColumn) {
+    return "Could not determine which column is the Mix ID — please answer the mapping question above and try again.";
+  }
+  if (plan.dataShape === "long" && (!plan.constituentIdColumn || !plan.quantityColumn)) {
+    return "This file needs both a constituent ID column and a quantity column identified above before it can be converted.";
+  }
+  return null;
 }

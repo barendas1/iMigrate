@@ -103,6 +103,17 @@ export interface MixConversionPlan {
   slumpColumn: string | null;       // reserved
   waterTargetColumn: string | null; // used only for zero-water filter
 
+  // Data shape: "wide" = one row per mix with Agg1..Agg6/Cem1..Cem4/Adm1..Adm8
+  // slot columns (e.g. MPAQ-style exports). "long" = one row PER CONSTITUENT,
+  // with the mix identifier/name repeated across rows (e.g. relational/
+  // junction-table exports). Omit to use the wide-format detection path.
+  dataShape?: "wide" | "long";
+  // Only used when dataShape === "long"
+  constituentIdColumn?: string | null;
+  constituentNameColumn?: string | null;
+  quantityColumn?: string | null;
+  unitColumn?: string | null;
+
   // Unit system (omit to auto-detect from file data)
   unitSystem?: UnitSystem;
 
@@ -135,6 +146,30 @@ function isZeroOrEmpty(val: any): boolean {
 
 function safeStr(val: any): string {
   return isEmptyValue(val) ? "" : String(val).trim();
+}
+
+// Raw UOM/inventory codes some source systems use instead of display-ready
+// unit names (e.g. "STN" for tons, "GLL"/"GLI" for gallons). Normalize these
+// to a friendly unit name before validating/outputting; anything not in this
+// map is passed through unchanged.
+const UOM_CODE_NORMALIZE: Record<string, string> = {
+  lbr: "lb", onz: "oz", oza: "oz", gll: "ga", gli: "ga",
+  stn: "ton", ydq: "yd", ea: "ea",
+};
+
+function normalizeUnitCode(raw: any): string {
+  const s = safeStr(raw);
+  if (!s) return s;
+  return UOM_CODE_NORMALIZE[s.toLowerCase()] ?? s;
+}
+
+// Some sources list multiple plant/location codes in a single cell
+// (e.g. "01, 02, 05") meaning the same mix/constituent applies to each —
+// split those into an explicit list so the row can be exploded downstream.
+function splitPlantList(raw: any): string[] {
+  const s = safeStr(raw);
+  if (!s) return [];
+  return s.split(/[,;]/).map((p) => p.trim()).filter(Boolean);
 }
 
 // ---------- UNIT DETECTION ----------
@@ -469,6 +504,147 @@ export function convertMixesWithPlan(
   };
 }
 
+// ---------- LONG-FORMAT CONVERSION (one row = one constituent) ----------
+//
+// Some source systems export mixes as a junction table: one row per
+// (mix, plant, constituent) with the mix ID/name repeated across many rows,
+// rather than the wide Agg1..Agg6/Cem1..Cem4/Adm1..Adm8 slot-column layout.
+// In that shape there's nothing to "collect" per mix — each row already IS
+// one output row, modulo plant explosion and unit/column normalization.
+function convertLongFormatMixRows(
+  rawHeaders: string[],
+  data: Record<string, any>[],
+  plan: MixConversionPlan,
+  mixIdCol: string | undefined,
+  nameCol: string | undefined,
+  plantCol: string | undefined,
+  waterTargetCol: string | undefined,
+  unitSystem: UnitSystem,
+  totalInputMixes: number
+): { dataRows: any[][]; issues: ValidationIssue[]; skippedMixes: number; totalInputMixes: number; unitSystem: UnitSystem } {
+  const issues: ValidationIssue[] = [];
+  let skippedMixes = 0;
+
+  // constituentNameColumn is detected/asked-about for context but intentionally
+  // unused here — Constituent Item Description always stays empty, matching
+  // the wide-format convention (the production item master supplies it).
+  const constituentIdCol = plan.constituentIdColumn || undefined;
+  const quantityCol = plan.quantityColumn || undefined;
+  const unitCol = plan.unitColumn || undefined;
+
+  if (!mixIdCol || !constituentIdCol || !quantityCol) {
+    const missing = [
+      !mixIdCol && "Mix ID",
+      !constituentIdCol && "Constituent Item Code",
+      !quantityCol && "Quantity",
+    ].filter(Boolean).join(", ");
+    issues.push({
+      type: "error",
+      message: `Long-format mix file is missing required column(s): ${missing}. File headers: ${rawHeaders.slice(0, 12).join(", ")}`,
+    });
+    return { dataRows: [], issues, skippedMixes: totalInputMixes, totalInputMixes, unitSystem };
+  }
+
+  const outputRows: any[][] = [];
+
+  for (let idx = 0; idx < data.length; idx++) {
+    const row = data[idx];
+    const dataRowNum = idx + 2;
+
+    const mixId = safeStr(row[mixIdCol]);
+    const constituentId = safeStr(row[constituentIdCol]);
+    if (!mixId || !constituentId) {
+      skippedMixes++;
+      continue;
+    }
+
+    if (plan.skipZeroWaterMixes && waterTargetCol && isZeroOrEmpty(row[waterTargetCol])) {
+      skippedMixes++;
+      continue;
+    }
+
+    const nameVal = nameCol ? safeStr(row[nameCol]) : mixId;
+    const mixDisplayName = nameVal || mixId;
+
+    const strengthMpa = plan.extractStrengthFromName ? extractStrength(mixDisplayName, unitSystem) : "";
+    const slumpRange = plan.extractSlumpRangeFromName
+      ? extractSlumpRange(mixDisplayName, unitSystem)
+      : { min: "", max: "" };
+
+    const qtyRaw = row[quantityCol];
+    const qty = (qtyRaw === null || qtyRaw === undefined || qtyRaw === "") ? null : Number(qtyRaw);
+    if (qty === null || isNaN(qty)) {
+      issues.push({
+        type: "error",
+        message: `Row ${dataRowNum} (Mix "${mixId}", material "${constituentId}"): Quantity is missing or not numeric.`,
+        row: dataRowNum,
+        field: "Quantity",
+      });
+    } else if (qty < 0) {
+      issues.push({
+        type: "error",
+        message: `Row ${dataRowNum} (Mix "${mixId}", material "${constituentId}"): Quantity is negative (${qty}).`,
+        row: dataRowNum,
+        field: "Quantity",
+      });
+    } else if (qty === 0 && !plan.includeZeroQuantityConstituents) {
+      skippedMixes++;
+      continue;
+    }
+
+    const unitName = normalizeUnitCode(unitCol ? row[unitCol] : "");
+
+    // Plant explode: a row may list multiple plant codes in one cell
+    // (e.g. Blalock-style "Location IDs" = "01, 05, 12")
+    let plantCodes = plantCol ? splitPlantList(row[plantCol]) : [];
+    if (plan.padPlantToTwoDigits) {
+      plantCodes = plantCodes.map((p) => (p.length === 1 ? "0" + p : p));
+    }
+    if (plantCodes.length === 0) {
+      issues.push({
+        type: "warning",
+        message: `Row ${dataRowNum} (Mix "${mixId}"): No plant/location assigned — row skipped.`,
+        row: dataRowNum,
+        field: "Plant Code",
+      });
+      skippedMixes++;
+      continue;
+    }
+
+    for (const plantCode of plantCodes) {
+      outputRows.push([
+        plantCode,                // Plant Code
+        mixDisplayName,           // Mix Name
+        mixDisplayName,           // Description
+        "",                       // Short Description
+        "",                       // Item Category
+        "",                       // Strength Age (Default 28)
+        strengthMpa,              // Strength (MPA)
+        "",                       // Design Air Content (%)
+        "",                       // Min Air Content (%)
+        "",                       // Max Air Content (%)
+        "",                       // Design Slump (mm)
+        slumpRange.min,           // Min Slump (mm)
+        slumpRange.max,           // Max Slump (mm)
+        "",                       // Max Batch Size
+        "",                       // Max Water Liters
+        "",                       // Max W/C+P
+        "",                       // Max W/C
+        "",                       // Mix Class Names, separate with semicolon
+        "",                       // Mix Usage
+        "",                       // Dispatch Slump Range
+        "",                       // Dispatch
+        constituentId,            // Constituent Item Code
+        "",                       // Constituent Item Description (always left empty)
+        qty === null ? qtyRaw : qty, // Quantity
+        unitName,                 // Unit Name
+      ]);
+    }
+  }
+
+  return { dataRows: outputRows, issues, skippedMixes, totalInputMixes, unitSystem };
+}
+
 function convertMixFileWithPlan(
   mixData: any[][],
   plan: MixConversionPlan,
@@ -508,6 +684,16 @@ function convertMixFileWithPlan(
   const nameCol = plan.mixNameColumn || colMap.name;
   const slumpCol = plan.slumpColumn || colMap.slump;
   const waterTargetCol = plan.waterTargetColumn || colMap.waterTarget;
+
+  // Long-format sources (one row PER CONSTITUENT, mix info repeated across
+  // rows — common in relational/junction-table exports) take a completely
+  // different extraction path from the wide Agg1..Agg6/Cem1..Cem4/Adm1..Adm8
+  // slot-column format assumed below.
+  if (plan.dataShape === "long") {
+    return convertLongFormatMixRows(
+      rawHeaders, data, plan, mixIdCol, nameCol, plantCol, waterTargetCol, unitSystem, totalInputMixes
+    );
+  }
 
   if (!mixIdCol) {
     issues.push({
@@ -571,16 +757,14 @@ function convertMixFileWithPlan(
     const nameVal = nameCol ? safeStr(row[nameCol]) : mixId;
     const slumpVal = slumpCol ? row[slumpCol] : "";
 
-    // Plant: from column or static
-    let plantCode: string;
-    if (plantCol && !isEmptyValue(row[plantCol])) {
-      plantCode = safeStr(row[plantCol]);
-      if (plan.padPlantToTwoDigits && plantCode.length === 1) {
-        plantCode = "0" + plantCode;
-      }
-    } else {
-      plantCode = "";
+    // Plant: from column or static. A cell may list multiple plant codes
+    // (e.g. "01, 02, 05") when the same mix applies to several plants —
+    // split those out so the row is exploded into one output row per plant.
+    let plantCodes: string[] = plantCol ? splitPlantList(row[plantCol]) : [];
+    if (plan.padPlantToTwoDigits) {
+      plantCodes = plantCodes.map((p) => (p.length === 1 ? "0" + p : p));
     }
+    if (plantCodes.length === 0) plantCodes = [""];
 
     // Derived values (pass unitSystem so strength/slump conversions are unit-aware)
     const strengthMpa = plan.extractStrengthFromName ? extractStrength(nameVal, unitSystem) : "";
@@ -724,34 +908,36 @@ function convertMixFileWithPlan(
     // Mix Name = descriptive name (from Name/mixNameColumn), not the short ID code
     const mixDisplayName = nameVal || mixId;
 
-    for (const [, matId, , matTarget, unitName] of constituents) {
-      outputRows.push([
-        plantCode,          // Plant Code
-        mixDisplayName,     // Mix Name
-        mixDisplayName,     // Description
-        "",                 // Short Description
-        "",                 // Item Category
-        "",                 // Strength Age (Default 28)
-        strengthMpa,        // Strength (MPA)
-        "",                 // Design Air Content (%)
-        "",                 // Min Air Content (%)
-        "",                 // Max Air Content (%)
-        "",                 // Design Slump (mm)
-        slumpRange.min,     // Min Slump (mm)
-        slumpRange.max,     // Max Slump (mm)
-        "",                 // Max Batch Size
-        "",                 // Max Water Liters
-        "",                 // Max W/C+P
-        "",                 // Max W/C
-        "",                 // Mix Class Names, separate with semicolon
-        "",                 // Mix Usage
-        "",                 // Dispatch Slump Range
-        "",                 // Dispatch
-        matId,              // Constituent Item Code
-        "",                 // Constituent Item Description
-        matTarget,          // Quantity
-        unitName,           // Unit Name
-      ]);
+    for (const plantCode of plantCodes) {
+      for (const [, matId, , matTarget, unitName] of constituents) {
+        outputRows.push([
+          plantCode,          // Plant Code
+          mixDisplayName,     // Mix Name
+          mixDisplayName,     // Description
+          "",                 // Short Description
+          "",                 // Item Category
+          "",                 // Strength Age (Default 28)
+          strengthMpa,        // Strength (MPA)
+          "",                 // Design Air Content (%)
+          "",                 // Min Air Content (%)
+          "",                 // Max Air Content (%)
+          "",                 // Design Slump (mm)
+          slumpRange.min,     // Min Slump (mm)
+          slumpRange.max,     // Max Slump (mm)
+          "",                 // Max Batch Size
+          "",                 // Max Water Liters
+          "",                 // Max W/C+P
+          "",                 // Max W/C
+          "",                 // Mix Class Names, separate with semicolon
+          "",                 // Mix Usage
+          "",                 // Dispatch Slump Range
+          "",                 // Dispatch
+          matId,              // Constituent Item Code
+          "",                 // Constituent Item Description
+          matTarget,          // Quantity
+          unitName,           // Unit Name
+        ]);
+      }
     }
   }
 

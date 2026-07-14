@@ -7,7 +7,7 @@ import { AlertCircle, Brain, ChevronRight, Loader2, RotateCcw, Sparkles } from "
 import { useState } from "react";
 import * as XLSX from "xlsx";
 import { convertMixesWithPlan } from "../converters/mixes/universal";
-import type { MixConversionPlan, MixConversionResult, ValidationIssue } from "../converters/mixes/universal";
+import type { MixConversionPlan, MixConversionResult, MixSkipBreakdown, ValidationIssue } from "../converters/mixes/universal";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -260,6 +260,55 @@ function buildManualMappingQuestions(headers: string[]): AIQuestion[] {
   ];
 }
 
+// A plan that "looks" convertible (passes planLooksConvertible below) can
+// still legitimately produce zero output rows — e.g. a mismapped water-target
+// column filters out every row. That's just as much a dead end as a failed
+// analysis, so it gets the same treatment: explain exactly why, and offer a
+// concrete, pre-filled way to fix it rather than a bare "0 output rows".
+
+function buildZeroOutputQuestions(
+  headers: string[],
+  breakdown: MixSkipBreakdown,
+  waterTargetColumnUsed: string | null
+): AIQuestion[] {
+  const qs: AIQuestion[] = [];
+  const dominantKey = (Object.entries(breakdown) as [keyof MixSkipBreakdown, number][])
+    .sort((a, b) => b[1] - a[1])[0]?.[0];
+
+  if (breakdown.zeroWaterFiltered > 0) {
+    qs.push({
+      id: "disable_zero_water_filter",
+      question: "Every affected row was removed by the zero-water-mix filter. Disable it and keep those rows?",
+      type: "select",
+      options: ["Yes - disable filter", "No - keep filtering"],
+      default: "Yes - disable filter",
+      context: waterTargetColumnUsed
+        ? `This filter checked column "${waterTargetColumnUsed}", which was empty or zero for every affected row — it may not be a real water-target column for this file.`
+        : "A water-target column was applied here even though none should have been — this usually means the wrong column got mapped.",
+    });
+  }
+
+  // If the water filter wasn't the dominant cause, the structural column
+  // mapping itself is probably wrong (not just one filter) — offer a full
+  // manual remap so the user isn't stuck re-running the same bad guess.
+  if (dominantKey !== "zeroWaterFiltered") {
+    qs.push(...buildManualMappingQuestions(headers));
+  }
+
+  return qs;
+}
+
+function describeZeroOutput(breakdown: MixSkipBreakdown, totalInput: number): string {
+  const parts: string[] = [];
+  if (breakdown.zeroWaterFiltered) parts.push(`${breakdown.zeroWaterFiltered} filtered out by the zero-water-mix rule`);
+  if (breakdown.missingIdentifiers) parts.push(`${breakdown.missingIdentifiers} missing a Mix ID/Constituent ID`);
+  if (breakdown.noPlantAssigned) parts.push(`${breakdown.noPlantAssigned} with no plant/location assigned`);
+  if (breakdown.noConstituents) parts.push(`${breakdown.noConstituents} with no constituents found`);
+  if (breakdown.other) parts.push(`${breakdown.other} for other reasons`);
+  const detail = parts.length ? parts.join("; ") : "for reasons that couldn't be categorized";
+  return `That produced 0 output rows — all ${totalInput} input row(s) were skipped (${detail}). Fix the item(s) below and convert again.`;
+}
+
 // ── Component ────────────────────────────────────────────────────────────────
 
 export function AIMixConversionPanel({
@@ -402,6 +451,37 @@ export function AIMixConversionPanel({
 
       setStatusMessage("Converting mixes...");
       const result: MixConversionResult = convertMixesWithPlan(fileDataCache, plan);
+
+      // A plan that passed the preflight check can still legitimately convert
+      // to nothing (e.g. a mismapped water-target column filters out every
+      // row). Never report that as a silent/blank success — diagnose it and
+      // hand the user a concrete, pre-filled way to fix it.
+      if (result.totalOutputRows === 0) {
+        const headers = (fileDataCache[0]?.data?.[0] ?? []).map((h: any) =>
+          String(h ?? "").replace(/^﻿/, "").trim()
+        );
+        const newQuestions = buildZeroOutputQuestions(headers, result.skipBreakdown, plan.waterTargetColumn ?? null);
+
+        setAnalysisResult((prev) => {
+          const base: AnalysisResult = prev ?? { analysis: "", fileAnalyses: [], questions: [] };
+          const existingIds = new Set((base.questions || []).map((q) => q.id));
+          const filteredNew = newQuestions.filter((q) => !existingIds.has(q.id));
+          return {
+            ...base,
+            analysis: describeZeroOutput(result.skipBreakdown, result.totalInputMixes),
+            questions: [...(base.questions || []), ...filteredNew],
+          };
+        });
+        setAnswers((prev) => {
+          const merged = { ...prev };
+          for (const q of newQuestions) {
+            if (merged[q.id] === undefined) merged[q.id] = q.default || (q.options?.[0] ?? "");
+          }
+          return merged;
+        });
+        setPhase("questioning");
+        return;
+      }
 
       const wb = XLSX.utils.book_new();
       const ws = XLSX.utils.aoa_to_sheet(result.rows);
@@ -632,6 +712,12 @@ function buildPlanFromAnalysis(
   const admUnitAns = ans("adm_unit");
   const admUnit = admUnitAns && admUnitAns !== "" ? admUnitAns : "ml/ckg CM";
 
+  // Zero-water-mix filter: on by default (inactive/template mixes usually
+  // have no water target), but the zero-output diagnosis flow
+  // (buildZeroOutputQuestions) offers to disable it when it turns out to be
+  // wiping out every row — e.g. a mismapped or nonexistent water column.
+  const skipZeroWaterMixes = !ans("disable_zero_water_filter").toLowerCase().startsWith("yes");
+
   return {
     plantColumn,
     mixIdColumn,
@@ -654,8 +740,7 @@ function buildPlanFromAnalysis(
     extractSlumpRangeFromName: extractSlumpRange,
     // Always include non-empty-ID constituents regardless of quantity
     includeZeroQuantityConstituents: true,
-    // Always skip mixes with no water target (they are inactive/template rows)
-    skipZeroWaterMixes: true,
+    skipZeroWaterMixes,
 
     admUnit,
     aggUnit: "kg",

@@ -55,6 +55,21 @@ export interface ValidationIssue {
   field?: string;
 }
 
+// Why rows didn't make it into the output — tracked so a zero (or
+// near-zero) output result can be explained precisely instead of just
+// reported as a generic "success" with nothing in it.
+export interface MixSkipBreakdown {
+  missingIdentifiers: number; // no Mix ID and/or Constituent ID resolved
+  zeroWaterFiltered: number;  // dropped by the skip-zero-water-mixes filter
+  noPlantAssigned: number;    // no plant/location code resolved
+  noConstituents: number;     // mix resolved but had zero constituent rows
+  other: number;
+}
+
+function emptySkipBreakdown(): MixSkipBreakdown {
+  return { missingIdentifiers: 0, zeroWaterFiltered: 0, noPlantAssigned: 0, noConstituents: 0, other: 0 };
+}
+
 export interface MixConversionResult {
   rows: any[][];
   issues: ValidationIssue[];
@@ -62,6 +77,7 @@ export interface MixConversionResult {
   totalInputMixes: number;
   totalOutputRows: number;
   unitSystem: UnitSystem;
+  skipBreakdown: MixSkipBreakdown;
 }
 
 // Valid recipe quantity units — SI mixes (metric plant, slump in mm)
@@ -475,13 +491,11 @@ export function convertMixesWithPlan(
   let totalSkipped = 0;
   let totalInput = 0;
   let detectedUnitSystem: UnitSystem = "SI";
+  const skipBreakdown = emptySkipBreakdown();
 
   for (const file of files) {
-    const { dataRows, issues, skippedMixes, totalInputMixes, unitSystem } = convertMixFileWithPlan(
-      file.data,
-      plan,
-      file.fileName
-    );
+    const { dataRows, issues, skippedMixes, totalInputMixes, unitSystem, skipBreakdown: fileSkipBreakdown } =
+      convertMixFileWithPlan(file.data, plan, file.fileName);
     allDataRows.push(...dataRows);
     allIssues.push(
       ...issues.map((issue) => ({
@@ -492,10 +506,14 @@ export function convertMixesWithPlan(
     totalSkipped += skippedMixes;
     totalInput += totalInputMixes;
     detectedUnitSystem = unitSystem;
+    (Object.keys(skipBreakdown) as (keyof MixSkipBreakdown)[]).forEach((k) => {
+      skipBreakdown[k] += fileSkipBreakdown[k];
+    });
   }
 
   return {
     rows: [MIX_TEMPLATE_COLUMNS, ...allDataRows],
+    skipBreakdown,
     issues: allIssues,
     skippedMixes: totalSkipped,
     totalInputMixes: totalInput,
@@ -521,9 +539,10 @@ function convertLongFormatMixRows(
   waterTargetCol: string | undefined,
   unitSystem: UnitSystem,
   totalInputMixes: number
-): { dataRows: any[][]; issues: ValidationIssue[]; skippedMixes: number; totalInputMixes: number; unitSystem: UnitSystem } {
+): { dataRows: any[][]; issues: ValidationIssue[]; skippedMixes: number; totalInputMixes: number; unitSystem: UnitSystem; skipBreakdown: MixSkipBreakdown } {
   const issues: ValidationIssue[] = [];
   let skippedMixes = 0;
+  const skipBreakdown = emptySkipBreakdown();
 
   // constituentNameColumn is detected/asked-about for context but intentionally
   // unused here — Constituent Item Description always stays empty, matching
@@ -542,7 +561,8 @@ function convertLongFormatMixRows(
       type: "error",
       message: `Long-format mix file is missing required column(s): ${missing}. File headers: ${rawHeaders.slice(0, 12).join(", ")}`,
     });
-    return { dataRows: [], issues, skippedMixes: totalInputMixes, totalInputMixes, unitSystem };
+    skipBreakdown.other = totalInputMixes;
+    return { dataRows: [], issues, skippedMixes: totalInputMixes, totalInputMixes, unitSystem, skipBreakdown };
   }
 
   const outputRows: any[][] = [];
@@ -555,11 +575,13 @@ function convertLongFormatMixRows(
     const constituentId = safeStr(row[constituentIdCol]);
     if (!mixId || !constituentId) {
       skippedMixes++;
+      skipBreakdown.missingIdentifiers++;
       continue;
     }
 
     if (plan.skipZeroWaterMixes && waterTargetCol && isZeroOrEmpty(row[waterTargetCol])) {
       skippedMixes++;
+      skipBreakdown.zeroWaterFiltered++;
       continue;
     }
 
@@ -589,6 +611,7 @@ function convertLongFormatMixRows(
       });
     } else if (qty === 0 && !plan.includeZeroQuantityConstituents) {
       skippedMixes++;
+      skipBreakdown.other++;
       continue;
     }
 
@@ -608,6 +631,7 @@ function convertLongFormatMixRows(
         field: "Plant Code",
       });
       skippedMixes++;
+      skipBreakdown.noPlantAssigned++;
       continue;
     }
 
@@ -642,20 +666,21 @@ function convertLongFormatMixRows(
     }
   }
 
-  return { dataRows: outputRows, issues, skippedMixes, totalInputMixes, unitSystem };
+  return { dataRows: outputRows, issues, skippedMixes, totalInputMixes, unitSystem, skipBreakdown };
 }
 
 function convertMixFileWithPlan(
   mixData: any[][],
   plan: MixConversionPlan,
   _fileNameHint?: string
-): { dataRows: any[][]; issues: ValidationIssue[]; skippedMixes: number; totalInputMixes: number; unitSystem: UnitSystem } {
+): { dataRows: any[][]; issues: ValidationIssue[]; skippedMixes: number; totalInputMixes: number; unitSystem: UnitSystem; skipBreakdown: MixSkipBreakdown } {
   const issues: ValidationIssue[] = [];
   let skippedMixes = 0;
+  const skipBreakdown = emptySkipBreakdown();
 
   if (!mixData || mixData.length < 2) {
     issues.push({ type: "error", message: "Mix file is empty or contains only a header row." });
-    return { dataRows: [], issues, skippedMixes, totalInputMixes: 0, unitSystem: "SI" };
+    return { dataRows: [], issues, skippedMixes, totalInputMixes: 0, unitSystem: "SI", skipBreakdown };
   }
 
   const rawHeaders: string[] = (mixData[0] as any[]).map((h) =>
@@ -700,7 +725,8 @@ function convertMixFileWithPlan(
       type: "error",
       message: `Could not detect a Mix ID column. File headers: ${rawHeaders.slice(0, 10).join(", ")}`,
     });
-    return { dataRows: [], issues, skippedMixes: totalInputMixes, totalInputMixes, unitSystem };
+    skipBreakdown.other = totalInputMixes;
+    return { dataRows: [], issues, skippedMixes: totalInputMixes, totalInputMixes, unitSystem, skipBreakdown };
   }
 
   // Warn once if plan's default units are not in the valid list for the detected unit system
@@ -740,6 +766,7 @@ function convertMixFileWithPlan(
     const waterTarget = waterTargetCol ? row[waterTargetCol] : "";
     if (plan.skipZeroWaterMixes && waterTargetCol && isZeroOrEmpty(waterTarget)) {
       skippedMixes++;
+      skipBreakdown.zeroWaterFiltered++;
       continue;
     }
 
@@ -751,6 +778,7 @@ function convertMixFileWithPlan(
         row: dataRowNum,
       });
       skippedMixes++;
+      skipBreakdown.missingIdentifiers++;
       continue;
     }
 
@@ -903,6 +931,7 @@ function convertMixFileWithPlan(
         message: `Row ${dataRowNum} (Mix "${mixId}"): No constituent materials found.`,
         row: dataRowNum,
       });
+      skipBreakdown.noConstituents++;
     }
 
     // Mix Name = descriptive name (from Name/mixNameColumn), not the short ID code
@@ -941,7 +970,7 @@ function convertMixFileWithPlan(
     }
   }
 
-  return { dataRows: outputRows, issues, skippedMixes, totalInputMixes, unitSystem };
+  return { dataRows: outputRows, issues, skippedMixes, totalInputMixes, unitSystem, skipBreakdown };
 }
 
 // ---------- LEGACY CONVERSION (non-AI path, kept for materials tab compatibility) ----------
@@ -1145,5 +1174,6 @@ export function convertAndMergeMixes(
     totalInputMixes: totalInput,
     totalOutputRows: allDataRows.length,
     unitSystem: "SI",
+    skipBreakdown: emptySkipBreakdown(),
   };
 }
